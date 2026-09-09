@@ -202,6 +202,8 @@ Item {
     root.currentWorkspaceId = isFinite(id) ? id : -1
   }
 
+  Component.onDestruction: if (root.opened) root.grabClickBinding(false)
+
   function rebuildRows(keepSelection) {
     var previous = keepSelection ? (rows[selectedIndex] || null) : null
     rows = Model.filteredWindows(allWindows, filterText)
@@ -325,6 +327,8 @@ Item {
     root.rows = []                // ... and does not inherit the old selection
     root.refresh(false)
     root.captureCurrentWorkspace()
+    root.pointerOverList = false
+    root.grabClickBinding(true)
     // rows[0] is the window you are on (sortedWindows ranks by focus history),
     // so a cycle summon always starts on the next candidate: the previous
     // window going forward, the least recent going back. Probing isCurrent()
@@ -338,6 +342,7 @@ Item {
 
   function close() {
     root.opened = false
+    root.grabClickBinding(false)
     root.cycleMode = false
     root.revealed = false
     revealTimer.stop()
@@ -346,6 +351,7 @@ Item {
   // User-initiated dismissal also drops the host's openPanelIds entry.
   function dismiss() {
     root.opened = false
+    root.grabClickBinding(false)
     root.cycleMode = false
     root.revealed = false
     revealTimer.stop()
@@ -363,6 +369,53 @@ Item {
     if (!root.opened) return "idle"
     root.dismiss()
     return "closed"
+  }
+
+  // The left mouse button is SUPER+mouse:272 ("Move window") in Omarchy, so
+  // while Super is held - which is always, when the switcher is up - Hyprland
+  // takes the button press and this overlay never sees it. Pointer MOTION does
+  // arrive, which is why hovering worked and clicking did not.
+  //
+  // Rebinding that button globally is not acceptable: an exec wrapper cannot
+  // start a window drag, because the compositor has to own the press for the
+  // whole gesture. So the switcher borrows the button only while it is open
+  // and hands it straight back on close - see grabClickBinding().
+  //
+  // No cursor position is passed: motion events already tell us where the
+  // pointer is and whether it is over a row.
+  property bool pointerOverList: false
+  property real pointerX: 0
+  property real pointerY: 0
+
+  function clickAt() {
+    if (!root.opened) return "idle"
+    if (root.pointerOverList) {
+      // Hover has already selected the row under the pointer.
+      root.focusSelected()
+    } else {
+      var originX = panel.screen ? panel.screen.x : 0
+      var originY = panel.screen ? panel.screen.y : 0
+      root.activateWindowAt(originX + root.pointerX, originY + root.pointerY)
+    }
+    return "handled"
+  }
+
+  readonly property string clickBindTarget: "'SUPER + mouse:272'"
+
+  // Borrow SUPER+left-click for as long as the switcher is up. Restoring binds
+  // Omarchy's own dispatcher back, not a wrapper, so dragging windows behaves
+  // exactly as it did before - the compositor owns the press again.
+  function grabClickBinding(grab) {
+    var lua = grab
+      // NOTE: no `{ mouse = true }` here. That flag is Hyprland's bindm, which
+      // only drives drag dispatchers (move/resize) - an exec bound that way
+      // never fires on click. The restore below DOES need it, because the drag
+      // is exactly what it is for.
+      ? "hl.unbind(" + root.clickBindTarget + "); hl.bind(" + root.clickBindTarget +
+        ", hl.dsp.exec_cmd([[omarchy-shell -q shell call piyush.omaswitch clickAt '']]))"
+      : "hl.unbind(" + root.clickBindTarget + "); hl.bind(" + root.clickBindTarget +
+        ", hl.dsp.window.drag(), { mouse = true })"
+    Quickshell.execDetached(["sh", "-c", "hyprctl eval \"" + lua + "\" >/dev/null 2>&1"])
   }
 
   // Companion to dismissIfOpen() for keys Hyprland binds globally: the arrow
@@ -446,6 +499,12 @@ Item {
 
     MouseArea {
       anchors.fill: parent
+      hoverEnabled: true
+      onPositionChanged: function(mouse) {
+        root.pointerOverList = false
+        root.pointerX = mouse.x
+        root.pointerY = mouse.y
+      }
       onClicked: function(mouse) {
         if (!root.clickSelectsWindow) return root.dismiss()
         // Panel coordinates -> compositor coordinates.
@@ -582,7 +641,24 @@ Item {
 
               MouseArea {
                 anchors.fill: parent
-                onClicked: { root.selectedIndex = index; root.focusSelected() }
+                hoverEnabled: true
+                // Hover moves the selection, so the mouse and the keyboard
+                // agree on what "the selected row" means and a click is just a
+                // confirmation of what is already highlighted.
+                //
+                // Deliberately onPositionChanged rather than onEntered: the
+                // switcher often opens with the pointer already sitting over a
+                // row, and onEntered would fire on open and silently steal the
+                // initial selection - which is the whole point of a quick
+                // Super+Tab. Only an actual mouse movement counts.
+                onPositionChanged: {
+                  root.pointerOverList = true
+                  if (root.selectedIndex !== index) root.selectedIndex = index
+                }
+                onClicked: {
+                  root.selectedIndex = index
+                  root.focusSelected()
+                }
               }
             }
           }

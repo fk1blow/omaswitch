@@ -12,15 +12,73 @@ function appId(window) {
   return String(ipc.class || ipc.initialClass || "")
 }
 
+function normalized(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "")
+}
+
+// "com.mitchellh.ghostty" -> "Ghostty", "google-chrome" -> "Google chrome".
+function prettyAppId(window) {
+  var id = appId(window)
+  if (!id) return ""
+  var last = String(id).split(".").pop().replace(/[-_]+/g, " ").trim()
+  if (!last) return ""
+  return last.charAt(0).toUpperCase() + last.slice(1)
+}
+
+var titleSeparators = [" — ", " – ", " - ", " | "]
+
+// Window titles usually end with the application's own name: "Report — Mozilla
+// Firefox", "inbox - Google Chrome". Showing that in the first row and the app
+// id in the second says the same thing twice, so the suffix is split off the
+// title and becomes the second row.
+//
+// The suffix is only stripped when it really is the application's name -
+// compared against the app id with punctuation and case removed - so a title
+// that merely contains a dash ("Bug 123 - fix the parser") is left intact.
+function splitTitle(window) {
+  var title = String((window && window.title) || "")
+  var result = { name: title, app: "" }
+  var idToken = normalized(String(appId(window)).split(".").pop())
+  if (!title || !idToken) return result
+
+  for (var i = 0; i < titleSeparators.length; i++) {
+    var separator = titleSeparators[i]
+    var at = title.lastIndexOf(separator)
+    if (at <= 0) continue
+    var head = title.slice(0, at).trim()
+    var tail = title.slice(at + separator.length).trim()
+    if (!head || !tail || tail.length > 40) continue
+    var tailToken = normalized(tail)
+    if (!tailToken) continue
+    if (tailToken.indexOf(idToken) === -1 && idToken.indexOf(tailToken) === -1) continue
+    result.name = head
+    result.app = tail
+    return result
+  }
+  return result
+}
+
 function label(window) {
-  return boundedText(window && window.title ? window.title : (appId(window) || "Untitled"))
+  var parts = splitTitle(window)
+  return boundedText(parts.name || prettyAppId(window) || "Untitled")
 }
 
 function detail(window) {
   if (!window) return ""
-  var value = appId(window)
-  if (window.workspace) value += (value ? " · " : "") + "ws " + String(window.workspace.id)
-  return boundedText(value)
+  var parts = splitTitle(window)
+  return boundedText(parts.app || prettyAppId(window))
+}
+
+// A workspace number on every row is noise: most windows sit on the one you are
+// already on. What matters is whether picking this window will move you off it,
+// so the workspace is reported only when it differs from the current one.
+function workspaceHint(window, currentWorkspaceId) {
+  if (!window || !window.workspace) return ""
+  var id = Number(window.workspace.id)
+  if (!isFinite(id)) return ""
+  var current = Number(currentWorkspaceId)
+  if (isFinite(current) && id === current) return ""
+  return "→ " + String(id)
 }
 
 // Hyprland's focusHistoryID is a rank in the compositor's global focus-history
@@ -48,8 +106,26 @@ function focusRank(window) {
   return isCurrent(window) ? -1 : historyRank(window)
 }
 
+// Quickshell's toplevel list also carries Wayland toplevels that have no
+// Hyprland client behind them: Steam's hidden helpers ("steamwebhelper",
+// "Steam SDL Dummy OpenGL Window", "VRStream"), IME surfaces ("Default IME",
+// "Input") and other never-mapped surfaces. They have no address, no
+// workspace and no class, so they cannot be focused - listing them just adds
+// dead rows. Keep only toplevels that map to a real, mapped Hyprland window.
+function isRealWindow(window) {
+  if (!window) return false
+  var raw = window.address
+  if (raw === null || raw === undefined || String(raw).trim() === "") return false
+  if (!window.workspace) return false
+  var ipc = window.lastIpcObject || {}
+  if (ipc.mapped === false) return false
+  if (ipc.hidden === true) return false
+  return true
+}
+
 function sortedWindows(values) {
   var source = values && typeof values.slice === "function" ? values.slice() : []
+  source = source.filter(isRealWindow)
   var decorated = []
   for (var i = 0; i < source.length; i++) decorated.push({ value: source[i], index: i })
   decorated.sort(function(left, right) {
@@ -68,26 +144,76 @@ function filteredWindows(values, query) {
   })
 }
 
-// Build the shell command that focuses a window AND moves to its workspace.
-// Native toplevel activate does not always switch the visible workspace, so
-// the switch is requested explicitly: prefer Omarchy's Lua dispatcher form
-// (hl.dsp.focus), fall back to the plain focuswindow syntax for stock
-// Hyprland. Returns null when the window has no address, deferring to the
-// native activate path in Switcher.qml.
+// Which window is under a screen point?
+//
+// Needed because Hyprland emits NO focus event when a window is clicked while
+// a layer holds exclusive keyboard focus - verified across nine switcher
+// sessions in the shell log - so an overlay cannot be told that the user
+// clicked past it. It has to consume the click and work out the target itself.
+//
+// Candidates are limited to the workspace on screen. Overlapping floating
+// windows tie-break by focus history: the most recently focused is the one
+// drawn on top, which is the one the user sees and means.
+function windowAt(windows, x, y, workspaceId) {
+  var list = windows || []
+  var best = null
+  var bestRank = Infinity
+  for (var i = 0; i < list.length; i++) {
+    var window = list[i]
+    if (!isRealWindow(window)) continue
+    if (workspaceId !== undefined && workspaceId !== null && workspaceId >= 0 &&
+        window.workspace && Number(window.workspace.id) !== Number(workspaceId)) continue
+    var ipc = window.lastIpcObject || {}
+    var at = ipc.at
+    var size = ipc.size
+    if (!at || !size || at.length < 2 || size.length < 2) continue
+    var left = Number(at[0])
+    var top = Number(at[1])
+    var right = left + Number(size[0])
+    var bottom = top + Number(size[1])
+    if (!(x >= left && x < right && y >= top && y < bottom)) continue
+    var rank = historyRank(window)
+    if (rank < bestRank) {
+      bestRank = rank
+      best = window
+    }
+  }
+  return best
+}
+
+// Build the shell command that focuses a window, moves to its workspace and
+// raises it above its siblings. Native toplevel activate does not always
+// switch the visible workspace, and focusing alone leaves a floating window
+// underneath the stack, so both steps are dispatched explicitly.
+//
+// Omarchy 4 / Hyprland's Lua binds only accept the hl.dsp form and reject the
+// legacy "focuswindow address:0x..." syntax with a non-zero exit, so the Lua
+// form runs first and the legacy syntax is the fallback for stock Hyprland.
+// Returns null when the window has no address, deferring to the native
+// activate path in Switcher.qml.
 function focusCommand(window) {
   var raw = window && window.address
   if (raw === null || raw === undefined || raw === "") return null
   var rawAddress = String(raw)
   var address = rawAddress.indexOf("0x") === 0 ? rawAddress : "0x" + rawAddress
-  return "hyprctl dispatch \"hl.dsp.focus({ window = 'address:" + address +
-    "' })\" >/dev/null 2>&1 || hyprctl dispatch focuswindow \"address:" + address + "\""
+  var target = "'address:" + address + "'"
+  var lua = "hyprctl dispatch \"hl.dsp.focus({ window = " + target + " })\" && " +
+    "hyprctl dispatch \"hl.dsp.window.bring_to_top({ window = " + target + " })\""
+  var legacy = "hyprctl dispatch focuswindow \"address:" + address + "\" && " +
+    "hyprctl dispatch alterzorder \"top,address:" + address + "\""
+  return "{ " + lua + " ; } >/dev/null 2>&1 || { " + legacy + " ; } >/dev/null 2>&1"
 }
 
 if (typeof module !== "undefined") module.exports = {
   appId: appId,
   label: label,
   detail: detail,
+  workspaceHint: workspaceHint,
+  splitTitle: splitTitle,
+  prettyAppId: prettyAppId,
   isCurrent: isCurrent,
+  isRealWindow: isRealWindow,
+  windowAt: windowAt,
   sortedWindows: sortedWindows,
   filteredWindows: filteredWindows,
   focusCommand: focusCommand

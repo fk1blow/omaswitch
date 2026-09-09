@@ -30,6 +30,32 @@ Item {
   // openPanelIds; we must not fight it, so `opened` is only our UI state.
   property bool opened: false
   property bool cycleMode: false
+
+  // macOS-style quick switch. A tap of the cycle key means "go back to the
+  // previous window" - the user already knows where they are going, so showing
+  // the overlay for 100ms just flashes the screen. The panel is still mapped
+  // immediately (it must be, to hold keyboard focus and see the modifier
+  // release), but it draws nothing until the reveal delay passes. Hold the
+  // modifier longer than that and the switcher appears as usual.
+  // Tune per binding with {"revealDelay": <ms>}; 0 shows it immediately.
+  property bool revealed: false
+  property int revealDelay: 180
+
+  // Clicking a window while the switcher is up should go to that window and
+  // close the switcher - without having to release the modifier first.
+  //
+  // Masking our input region down to the card so the compositor routes the
+  // click to the window underneath does NOT work here: Hyprland then tells us
+  // nothing. Nine logged sessions showed no activewindow event while this
+  // layer held exclusive keyboard focus, so the overlay could not know the
+  // click happened and stayed up, and the modifier release then overrode the
+  // user's choice with the list selection.
+  //
+  // So the overlay keeps the whole screen as its input region, consumes the
+  // click, resolves the window under the pointer itself, focuses it and
+  // closes. The trade-off is that the click does not also press whatever was
+  // under it - it selects the window, like clicking a taskbar entry.
+  property bool clickSelectsWindow: true
   property string filterText: ""
   property int selectedIndex: 0
 
@@ -37,17 +63,32 @@ Item {
   property var allWindows: []
   property var rows: []
 
-  readonly property int headerHeight: Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
-  readonly property int rowHeight: Math.max(Style.space(48), Style.font.body + Style.font.caption + Style.spacing.rowPaddingX * 2)
+  // The static "Switch window…" header said nothing the user did not already
+  // know, so the row only exists while there is a filter to show.
+  readonly property bool filtering: root.filterText !== ""
+  readonly property int titleFont: Style.font.heading
+  readonly property int detailFont: Style.font.body
+  readonly property int headerHeight: root.filtering
+    ? Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
+    : 0
+  readonly property int rowHeight: Math.max(Style.space(58), root.titleFont + root.detailFont + Style.spacing.rowPaddingX * 2)
   readonly property int contentMargin: Style.spacing.panelPadding
-  readonly property int listGap: Style.space(4)
+  readonly property int listGap: root.filtering ? Style.space(4) : 0
   readonly property int gap: Style.space(12)
 
   // Guard the index: assigning a shorter rows array notifies bindings before
   // rebuildRows() gets to clamp selectedIndex.
   readonly property var selectedToplevel: selectedIndex >= 0 && selectedIndex < rows.length ? rows[selectedIndex] : null
   readonly property bool previewWanted: root.opened && root.selectedToplevel !== null && !!root.selectedToplevel.wayland
-  readonly property bool previewActive: root.previewWanted && previewView.hasContent
+  // hasContent drops to false while ScreencopyView acquires its first frame
+  // from a newly selected window. Sizing the card off it directly made the
+  // preview pane collapse and the whole card snap 1080 -> 760 -> 1080 on every
+  // cycle step: a visible flicker. Once the compositor has proven it can
+  // export a window, keep the pane's geometry reserved for the session; a
+  // compositor without hyprland-toplevel-export never latches and the list
+  // stays full-width as before.
+  property bool previewLatched: false
+  readonly property bool previewActive: root.previewWanted && (previewView.hasContent || root.previewLatched)
 
   readonly property int cardWidth: Math.min(root.previewActive ? Style.space(1080) : Style.space(760), panel.width - Style.gapsOut * 2)
   readonly property int desiredListHeight: Math.max(root.rowHeight, rows.length * root.rowHeight)
@@ -69,14 +110,108 @@ Item {
   property color foreground: Color.menu.text
   property color border: Color.menu.border
   property var borderSpec: Border.surfaceSpec("menu", "border", border, Math.max(1, Style.space(2)))
+  property bool showScrim: false
   property color scrim: Color.menu.scrim
   property color selectedBackground: Color.menu.selectedBackground
   property color selectedText: Color.menu.selectedText
   readonly property int cornerRadius: Style.cornerRadius
   property string fontFamily: Style.font.menuFamily
 
-  function rebuildRows() {
+  // Application icons. The window gives us an app id ("firefox",
+  // "com.mitchellh.ghostty"); the desktop entry for it gives the icon NAME,
+  // which the shell's AppLibrary then resolves to a file (it keeps an index for
+  // icons installed after this process started, and falls back to a generic
+  // executable icon). Both lookups are cached: this runs per delegate, per
+  // repaint.
+  property bool showIcons: true
+  property int iconSize: Math.max(16, Math.round(root.rowHeight * 0.62) - 12)
+  property var entryIndex: null
+  property var iconCache: ({})
+
+  function desktopEntryFor(id) {
+    if (root.entryIndex === null) {
+      var index = ({})
+      try {
+        var values = (DesktopEntries.applications && DesktopEntries.applications.values) || []
+        for (var i = 0; i < values.length; i++) {
+          var entry = values[i]
+          if (!entry) continue
+          var keys = [entry.id, entry.name, entry.startupClass]
+          for (var k = 0; k < keys.length; k++) {
+            var key = String(keys[k] || "").toLowerCase().replace(/\.desktop$/, "")
+            if (key && index[key] === undefined) index[key] = entry
+          }
+        }
+      } catch (e) {
+        // A Quickshell without DesktopEntries just means no icons.
+      }
+      root.entryIndex = index
+    }
+    var want = String(id || "").toLowerCase().replace(/\.desktop$/, "")
+    if (!want) return null
+    return root.entryIndex[want] || root.entryIndex[want.split(".").pop()] || null
+  }
+
+  function resolveIcon(id) {
+    var entry = root.desktopEntryFor(id)
+    var name = entry && entry.icon ? String(entry.icon) : String(id)
+    try {
+      return root.shell && root.shell.appLibrary
+        ? String(root.shell.appLibrary.iconSource(name) || "")
+        : String(Quickshell.iconPath(name, true) || "")
+    } catch (e) {
+      return ""
+    }
+  }
+
+  // Resolved once per refresh, never from inside a delegate binding: reading
+  // and writing the cache during binding evaluation is a binding loop.
+  // Delegates only ever read the finished map.
+  function rebuildIcons() {
+    if (!root.showIcons) { root.iconCache = ({}); return }
+    var next = ({})
+    var changed = false
+    for (var i = 0; i < root.allWindows.length; i++) {
+      var id = Model.appId(root.allWindows[i])
+      if (!id || next[id] !== undefined) continue
+      next[id] = root.iconCache[id] !== undefined ? root.iconCache[id] : root.resolveIcon(id)
+      if (root.iconCache[id] === undefined) changed = true
+    }
+    for (var key in root.iconCache) if (next[key] === undefined) changed = true
+    if (changed) root.iconCache = next
+  }
+
+  // keepSelection: follow the selected WINDOW across a rebuild rather than
+  // holding an index. A refresh triggered by a compositor event must not slide
+  // the highlight onto a different window under the user's fingers.
+  // Captured when the switcher opens: the overlay taking focus does not change
+  // the workspace, and a live binding would only add churn.
+  property int currentWorkspaceId: -1
+
+  function captureCurrentWorkspace() {
+    var id = -1
+    try {
+      if (Hyprland.focusedWorkspace && Hyprland.focusedWorkspace.id !== undefined)
+        id = Number(Hyprland.focusedWorkspace.id)
+    } catch (e) {
+      id = -1
+    }
+    // Fallback: rows[0] is the window you are on, so its workspace is yours.
+    if (!(id > 0) && root.rows.length > 0 && root.rows[0] && root.rows[0].workspace)
+      id = Number(root.rows[0].workspace.id)
+    root.currentWorkspaceId = isFinite(id) ? id : -1
+  }
+
+  function rebuildRows(keepSelection) {
+    var previous = keepSelection ? (rows[selectedIndex] || null) : null
     rows = Model.filteredWindows(allWindows, filterText)
+    if (previous) {
+      var at = rows.indexOf(previous)
+      if (at !== -1) {
+        selectedIndex = at
+        return
+      }
+    }
     if (selectedIndex >= rows.length) selectedIndex = Math.max(0, rows.length - 1)
     if (selectedIndex < 0 && rows.length > 0) selectedIndex = 0
   }
@@ -84,24 +219,79 @@ Item {
   function setFilter(value) {
     filterText = value
     selectedIndex = 0
-    rebuildRows()
+    rebuildRows(false)
   }
 
-  function refresh() {
-    allWindows = Model.sortedWindows(Hyprland.toplevels.values)
-    rebuildRows()
+  function refresh(keepSelection) {
+    var sorted = Model.sortedWindows(Hyprland.toplevels.values)
+    if (!root.opened || root.allWindows.length === 0) {
+      root.allWindows = sorted
+    } else {
+      // Most-recently-used order is only meaningful at the moment the switcher
+      // opens. Hyprland emits activewindow as this overlay takes focus, and
+      // re-sorting on that event reshuffles the list while the user is aiming
+      // at a row. Keep the established order; take only additions and removals.
+      var kept = []
+      for (var i = 0; i < root.allWindows.length; i++)
+        if (sorted.indexOf(root.allWindows[i]) !== -1) kept.push(root.allWindows[i])
+      for (var j = 0; j < sorted.length; j++)
+        if (kept.indexOf(sorted[j]) === -1) kept.push(sorted[j])
+      root.allWindows = kept
+    }
+    rebuildIcons()
+    rebuildRows(keepSelection === true)
   }
+
+  // Focus must be applied AFTER this overlay is gone. The panel holds
+  // exclusive keyboard focus while it is visible, so a focus dispatch issued
+  // before it closes is undone the moment the compositor tears the layer down
+  // and restores focus to the window that was active before we opened.
+  // Dismiss first, then dispatch on the next tick.
+  property var pendingWindow: null
+  property string pendingCommand: ""
 
   function focusSelected() {
     var window = rows[selectedIndex]
     if (!window) return root.dismiss()
-    var command = Model.focusCommand(window)
-    if (command) {
-      Quickshell.execDetached(["sh", "-c", command])
-    } else if (window.wayland && typeof window.wayland.activate === "function") {
-      window.wayland.activate()
-    }
+    root.pendingCommand = Model.focusCommand(window) || ""
+    root.pendingWindow = window
     root.dismiss()
+    focusTimer.restart()
+  }
+
+  Timer {
+    id: focusTimer
+    interval: 80
+    repeat: false
+    onTriggered: {
+      var window = root.pendingWindow
+      if (root.pendingCommand) {
+        Quickshell.execDetached(["sh", "-c", root.pendingCommand])
+      } else if (window && window.wayland && typeof window.wayland.activate === "function") {
+        window.wayland.activate()
+      }
+      root.pendingCommand = ""
+      root.pendingWindow = null
+    }
+  }
+
+  Timer {
+    id: revealTimer
+    interval: root.revealDelay
+    repeat: false
+    onTriggered: if (root.opened) root.revealed = true
+  }
+
+  // A click that landed outside the card: focus whatever window is there and
+  // close. Falls back to a plain cancel when the click hit no window (the bar,
+  // the desktop), which is what clicking "nothing" should do anyway.
+  function activateWindowAt(x, y) {
+    var target = Model.windowAt(Hyprland.toplevels.values, x, y, root.currentWorkspaceId)
+    if (!target) return root.dismiss()
+    root.pendingCommand = Model.focusCommand(target) || ""
+    root.pendingWindow = target
+    root.dismiss()
+    focusTimer.restart()
   }
 
   function select(delta) {
@@ -123,36 +313,93 @@ Item {
 
     root.opened = true
     root.cycleMode = payload.mode === "cycle"
+    var requested = Number(payload.revealDelay)
+    root.revealDelay = isFinite(requested) && requested >= 0 ? requested : 180
+    // Only a cycle summon is a candidate for the quick path; an explicit
+    // toggle/summon of the picker should appear at once.
+    root.revealed = !root.cycleMode || root.revealDelay === 0
+    if (!root.revealed) revealTimer.restart()
     root.filterText = ""
     root.selectedIndex = 0
-    root.refresh()
-    if (root.cycleMode && root.rows.length > 1 && Model.isCurrent(root.rows[0]))
+    root.allWindows = []          // a fresh summon re-sorts by MRU
+    root.rows = []                // ... and does not inherit the old selection
+    root.refresh(false)
+    root.captureCurrentWorkspace()
+    // rows[0] is the window you are on (sortedWindows ranks by focus history),
+    // so a cycle summon always starts on the next candidate: the previous
+    // window going forward, the least recent going back. Probing isCurrent()
+    // here used to suppress that step whenever the compositor reported no
+    // activated window - e.g. when focus had already moved to this overlay.
+    if (root.cycleMode && root.rows.length > 1)
       root.selectedIndex = direction < 0 ? root.rows.length - 1 : 1
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    focusGrab.restart()
   }
 
   function close() {
     root.opened = false
     root.cycleMode = false
+    root.revealed = false
+    revealTimer.stop()
   }
 
   // User-initiated dismissal also drops the host's openPanelIds entry.
   function dismiss() {
     root.opened = false
     root.cycleMode = false
+    root.revealed = false
+    revealTimer.stop()
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "piyush.omaswitch")
+  }
+
+  // Hyprland resolves its own keybinds before handing keys to a layer
+  // surface, so a bound combination (e.g. Omarchy's SUPER+ESCAPE system menu)
+  // never reaches this overlay while the modifier is held. A binding can call
+  // this over IPC to give the switcher first refusal on the key:
+  //   omarchy-shell shell call piyush.omaswitch dismissIfOpen ""
+  // Answers "closed" when it consumed the key, "idle" when it was not open.
+  function dismissIfOpen() {
+    if (!root.opened) return "idle"
+    root.dismiss()
+    return "closed"
+  }
+
+  // Companion to dismissIfOpen() for keys Hyprland binds globally: the arrow
+  // keys are SUPER+UP/DOWN ("focus above/below window") in Omarchy, so they
+  // never reach this overlay while Super is held.
+  //   omarchy-shell shell call piyush.omaswitch navigateIfOpen prev
+  // Accepts "prev"/"up"/"-1" or "next"/"down"/"1". Answers "moved" when it
+  // consumed the key, "idle" when the switcher was not open.
+  function navigateIfOpen(arg) {
+    if (!root.opened) return "idle"
+    var value = String(arg === undefined || arg === null ? "" : arg).trim().toLowerCase()
+    var back = value === "prev" || value === "up" || value === "-1" || Number(value) < 0
+    root.select(back ? -1 : 1)
+    return "moved"
+  }
+
+  Connections {
+    target: DesktopEntries.applications
+    ignoreUnknownSignals: true
+    function onValuesChanged() {
+      root.entryIndex = null
+      root.iconCache = ({})
+      if (root.opened) root.rebuildIcons()
+    }
   }
 
   // Keep the list fresh while open (windows open/close/rename).
   Connections {
     target: Hyprland
     function onRawEvent(event) {
-      if (!root.opened) return
       var name = event ? String(event.name || "") : ""
+      if (name.indexOf("activewindow") === 0 || name === "openlayer")
+      if (!root.opened) return
+
       if (name === "activewindow" || name === "closewindow" || name === "openwindow" ||
           name === "workspace" || name === "movewindow" || name.indexOf("windowtitle") === 0) {
-        root.refresh()
+        root.refresh(true)
       }
     }
   }
@@ -167,18 +414,50 @@ Item {
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
     exclusionMode: ExclusionMode.Ignore
 
+
+    // A single Qt.callLater() grab races the surface being mapped: on the
+    // keybinding path the window may not exist yet when it runs, leaving the
+    // overlay visible but deaf (Escape, typing and the modifier release all
+    // go nowhere). Re-assert focus while the panel is up until it sticks.
+    onVisibleChanged: if (visible) focusGrab.restart()
+
+    Timer {
+      id: focusGrab
+      interval: 25
+      repeat: true
+      triggeredOnStart: true
+      property int attempts: 0
+      onTriggered: {
+        if (!root.opened) { attempts = 0; stop(); return }
+        keyCatcher.forceActiveFocus()
+        attempts += 1
+        if (keyCatcher.activeFocus || attempts > 20) { attempts = 0; stop() }
+      }
+    }
+
+    // The full-screen dim is off: darkening and un-darkening the whole desktop
+    // around a switcher that may only be up for a moment reads as a flash.
+    // Set showScrim to true to get it back.
     Rectangle {
       anchors.fill: parent
       color: root.scrim
+      visible: root.revealed && root.showScrim
     }
 
     MouseArea {
       anchors.fill: parent
-      onClicked: root.dismiss()
+      onClicked: function(mouse) {
+        if (!root.clickSelectsWindow) return root.dismiss()
+        // Panel coordinates -> compositor coordinates.
+        var originX = panel.screen ? panel.screen.x : 0
+        var originY = panel.screen ? panel.screen.y : 0
+        root.activateWindowAt(originX + mouse.x, originY + mouse.y)
+      }
     }
 
     BorderSurface {
       id: card
+      visible: root.revealed
       width: root.cardWidth
       height: root.cardHeight
       radius: root.cornerRadius
@@ -197,7 +476,10 @@ Item {
           spacing: root.listGap
 
           Text {
-            text: root.filterText === "" ? "Switch window…" : "Filter: " + root.filterText
+            visible: root.filtering
+            height: root.headerHeight
+            verticalAlignment: Text.AlignVCenter
+            text: "Filter: " + root.filterText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
@@ -221,7 +503,7 @@ Item {
               color: root.foreground
               opacity: 0.6
               font.family: root.fontFamily
-              font.pixelSize: Style.font.body
+              font.pixelSize: root.titleFont
             }
 
             delegate: Item {
@@ -236,11 +518,45 @@ Item {
                 color: index === root.selectedIndex ? root.selectedBackground : "transparent"
               }
 
-              Column {
+              Image {
+                id: rowIcon
+                readonly property string resolved: root.iconCache[Model.appId(modelData)] || ""
+                visible: resolved !== ""
+                source: resolved
+                width: root.iconSize
+                height: root.iconSize
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                // Decode at physical pixels: a logical-size decode leaves PNG
+                // icons upscaled and blurry on HiDPI displays.
+                sourceSize.width: width * Screen.devicePixelRatio
+                sourceSize.height: height * Screen.devicePixelRatio
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.left: parent.left
                 anchors.leftMargin: Style.space(10)
+              }
+
+              Text {
+                id: rowWorkspace
+                text: Model.workspaceHint(modelData, root.currentWorkspaceId)
+                visible: text !== ""
+                textFormat: Text.PlainText
+                color: index === root.selectedIndex ? root.selectedText : root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: root.detailFont
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(12)
+              }
+
+              Column {
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.left: rowIcon.visible ? rowIcon.right : parent.left
+                anchors.leftMargin: Style.space(10)
                 width: parent.width - Style.space(20)
+                  - (rowIcon.visible ? rowIcon.width + Style.space(10) : 0)
+                  - (rowWorkspace.visible ? rowWorkspace.width + Style.space(10) : 0)
                 spacing: 2
 
                 Text {
@@ -248,7 +564,7 @@ Item {
                   textFormat: Text.PlainText
                   color: index === root.selectedIndex ? root.selectedText : root.foreground
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
+                  font.pixelSize: root.titleFont
                   elide: Text.ElideRight
                   width: parent.width
                 }
@@ -258,7 +574,7 @@ Item {
                   color: index === root.selectedIndex ? root.selectedText : root.foreground
                   opacity: 0.6
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.detailFont
                   elide: Text.ElideRight
                   width: parent.width
                 }
@@ -291,6 +607,7 @@ Item {
             live: root.previewWanted
             paintCursor: false
             constraintSize: Qt.size(root.previewConstraintWidth, root.previewConstraintHeight)
+            onHasContentChanged: if (hasContent) root.previewLatched = true
           }
         }
       }

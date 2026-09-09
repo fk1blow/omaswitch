@@ -1,18 +1,18 @@
 const assert = require("node:assert/strict")
 const Model = require("./Model.js")
 
-const active = { title: "Browser", activated: true, wayland: { appId: "chromium" }, workspace: { id: 1 }, lastIpcObject: { focusHistoryID: 0 } }
-const previous = { title: "Terminal", activated: false, wayland: { appId: "foot" }, workspace: { id: 2 }, lastIpcObject: { focusHistoryID: 1 } }
-const old = { title: "Notes", activated: false, lastIpcObject: { class: "obsidian", focusHistoryID: 8 }, workspace: { id: 3 } }
+const active = { title: "Browser", address: "0xa1", activated: true, wayland: { appId: "chromium" }, workspace: { id: 1 }, lastIpcObject: { focusHistoryID: 0 } }
+const previous = { title: "Terminal", address: "0xa2", activated: false, wayland: { appId: "foot" }, workspace: { id: 2 }, lastIpcObject: { focusHistoryID: 1 } }
+const old = { title: "Notes", address: "0xa3", activated: false, lastIpcObject: { class: "obsidian", focusHistoryID: 8 }, workspace: { id: 3 } }
 
 assert.deepEqual(Model.sortedWindows([old, previous, active]), [active, previous, old])
 assert.equal(Model.isCurrent(active), true)
 assert.equal(Model.isCurrent({ activated: false, lastIpcObject: { focusHistoryID: 0 } }), true)
 assert.deepEqual(Model.filteredWindows([active, previous, old], "foot"), [previous])
 assert.deepEqual(Model.filteredWindows([active, previous, old], "notes"), [old])
-assert.equal(Model.detail(old), "obsidian · ws 3")
+assert.equal(Model.detail(old), "Obsidian")
 assert.equal(Model.label({ title: "x".repeat(161) }), "x".repeat(159) + "…")
-assert.equal(Model.detail({ wayland: { appId: "x".repeat(161) } }), "x".repeat(159) + "…")
+assert.equal(Model.detail({ wayland: { appId: "x".repeat(161) } }), "X" + "x".repeat(158) + "…")
 
 // --- focusCommand: switching to windows on other workspaces ---
 // Reproduces the bug: confirming a selection previously used the native
@@ -22,14 +22,19 @@ assert.equal(Model.detail({ wayland: { appId: "x".repeat(161) } }), "x".repeat(1
 // workspace-switching command.
 const target = { title: "Browser", address: "55ea685ceda0", workspace: { id: 5 } }
 const targetHex = { title: "Browser", address: "0x55ea685ceda0", workspace: { id: 5 } }
-const expected = "hyprctl dispatch \"hl.dsp.focus({ window = 'address:0x55ea685ceda0' })\" >/dev/null 2>&1 || hyprctl dispatch focuswindow \"address:0x55ea685ceda0\""
+const expected = "{ hyprctl dispatch \"hl.dsp.focus({ window = 'address:0x55ea685ceda0' })\" && " +
+  "hyprctl dispatch \"hl.dsp.window.bring_to_top({ window = 'address:0x55ea685ceda0' })\" ; } >/dev/null 2>&1 || " +
+  "{ hyprctl dispatch focuswindow \"address:0x55ea685ceda0\" && " +
+  "hyprctl dispatch alterzorder \"top,address:0x55ea685ceda0\" ; } >/dev/null 2>&1"
 
 assert.ok(Model.focusCommand(target), "window with address must produce a dispatch command")
 assert.equal(Model.focusCommand(target), expected, "address must be normalized with 0x prefix")
 assert.equal(Model.focusCommand(targetHex), expected, "existing 0x prefix must be preserved")
-assert.ok(Model.focusCommand(target).startsWith("hyprctl dispatch \"hl.dsp.focus("),
+assert.ok(Model.focusCommand(target).indexOf("hl.dsp.focus(") !== -1,
   "primary dispatch must be the workspace-switching hl.dsp.focus form")
-assert.ok(Model.focusCommand(target).includes("|| hyprctl dispatch focuswindow \"address:0x55ea685ceda0\""),
+assert.ok(Model.focusCommand(target).indexOf("hl.dsp.window.bring_to_top(") !== -1,
+  "focusing alone does not raise the window; the selection must be brought to the top")
+assert.ok(Model.focusCommand(target).includes("|| { hyprctl dispatch focuswindow \"address:0x55ea685ceda0\""),
   "plain focuswindow must remain as the stock-Hyprland fallback")
 assert.equal(Model.focusCommand({}), null, "no address defers to native activate fallback")
 assert.equal(Model.focusCommand(null), null, "no window defers to native activate fallback")
@@ -42,11 +47,11 @@ console.log("Model checks passed")
 // current window (rank 0), surfacing stale windows above genuinely recent
 // ones and mislabeling them as current. They must sort AFTER all ranked
 // windows, in source order, and never be treated as current.
-const editorCur = { title: "Editor", activated: true, lastIpcObject: { focusHistoryID: 0 }, wayland: { appId: "ed" } }
-const termPrev = { title: "Term", activated: false, lastIpcObject: { focusHistoryID: 1 }, wayland: { appId: "foot" } }
-const staleNull = { title: "StalePopup", activated: false, lastIpcObject: { focusHistoryID: null }, wayland: { appId: "popup" } }
-const staleEmpty = { title: "Mystery", activated: false, lastIpcObject: { focusHistoryID: "" }, wayland: { appId: "unknown" } }
-const staleBlank = { title: "Blank", activated: false, lastIpcObject: { focusHistoryID: " " }, wayland: { appId: "blank" } }
+const editorCur = { address: "0xeditorcur", workspace: { id: 1 }, title: "Editor", activated: true, lastIpcObject: { focusHistoryID: 0 }, wayland: { appId: "ed" } }
+const termPrev = { address: "0xtermprev", workspace: { id: 1 }, title: "Term", activated: false, lastIpcObject: { focusHistoryID: 1 }, wayland: { appId: "foot" } }
+const staleNull = { address: "0xstalenull", workspace: { id: 1 }, title: "StalePopup", activated: false, lastIpcObject: { focusHistoryID: null }, wayland: { appId: "popup" } }
+const staleEmpty = { address: "0xstaleempty", workspace: { id: 1 }, title: "Mystery", activated: false, lastIpcObject: { focusHistoryID: "" }, wayland: { appId: "unknown" } }
+const staleBlank = { address: "0xstaleblank", workspace: { id: 1 }, title: "Blank", activated: false, lastIpcObject: { focusHistoryID: " " }, wayland: { appId: "blank" } }
 
 assert.deepEqual(
   Model.sortedWindows([termPrev, editorCur, staleNull, staleEmpty, staleBlank]).map(function(w) { return w.title }),
@@ -59,3 +64,78 @@ assert.equal(Model.isCurrent(staleEmpty), false, "empty focusHistoryID must not 
 assert.equal(Model.isCurrent({ activated: false, lastIpcObject: {} }), false, "missing focusHistoryID must not be current")
 assert.equal(Model.isCurrent(editorCur), true, "activated window must be current")
 assert.equal(Model.isCurrent({ activated: false, lastIpcObject: { focusHistoryID: 0 } }), true, "real rank 0 must be current")
+
+// --- non-window toplevels ---
+// Quickshell's toplevel list carries Wayland toplevels with no Hyprland client
+// behind them (Steam's hidden helpers, IME surfaces). They have no address and
+// no workspace, cannot be focused, and must never reach the list.
+const ime = { title: "Default IME" }
+const steamHelper = { title: "steamwebhelper", address: "" }
+const unmapped = { title: "Hidden", address: "0xb1", workspace: { id: 1 }, lastIpcObject: { mapped: false } }
+const hidden = { title: "Hidden", address: "0xb2", workspace: { id: 1 }, lastIpcObject: { hidden: true } }
+
+assert.equal(Model.isRealWindow(ime), false, "a toplevel with no address is not a window")
+assert.equal(Model.isRealWindow(steamHelper), false, "an empty address is not a window")
+assert.equal(Model.isRealWindow(unmapped), false, "an unmapped client is not selectable")
+assert.equal(Model.isRealWindow(hidden), false, "a hidden client is not selectable")
+assert.equal(Model.isRealWindow(active), true, "a real window survives the filter")
+assert.deepEqual(
+  Model.sortedWindows([ime, active, steamHelper, previous]).map(function(w) { return w.title }),
+  ["Browser", "Terminal"],
+  "non-window toplevels must be dropped from the list"
+)
+
+// --- title / app split ---
+// The app name appears in the window title AND in the app id; showing both is
+// redundant, so the title's trailing app name becomes the second row.
+const firefox = { title: "(2) WhatsApp — Mozilla Firefox", address: "0xc1", workspace: { id: 2 }, wayland: { appId: "firefox" } }
+const chrome = { title: "inbox - Google Chrome", address: "0xc2", workspace: { id: 1 }, wayland: { appId: "google-chrome" } }
+const ghostty = { title: "◑ deploy", address: "0xc3", workspace: { id: 2 }, wayland: { appId: "com.mitchellh.ghostty" } }
+const dashed = { title: "Bug 123 - fix the parser", address: "0xc4", workspace: { id: 3 }, wayland: { appId: "code" } }
+
+assert.equal(Model.label(firefox), "(2) WhatsApp", "the app name must be stripped from the title")
+assert.equal(Model.detail(firefox), "Mozilla Firefox", "the stripped app name becomes the second row")
+assert.equal(Model.label(chrome), "inbox", "a plain hyphen separator is handled too")
+assert.equal(Model.detail(chrome), "Google Chrome")
+assert.equal(Model.label(ghostty), "◑ deploy", "a title with no app suffix is left alone")
+assert.equal(Model.detail(ghostty), "Ghostty", "a reverse-DNS app id is prettified for the second row")
+assert.equal(Model.label(dashed), "Bug 123 - fix the parser",
+  "a dash that is not the app name must not be stripped")
+assert.equal(Model.detail(dashed), "Code")
+assert.equal(Model.label({ address: "0xc5", workspace: { id: 1 } }), "Untitled", "a window with no title still labels")
+
+console.log("all checks passed")
+
+// --- workspace hint ---
+// The workspace is only worth showing when picking the window would move you
+// off the one you are on.
+assert.equal(Model.workspaceHint(firefox, 2), "", "same workspace shows nothing")
+assert.equal(Model.workspaceHint(firefox, 3), "→ 2", "a different workspace is called out")
+assert.equal(Model.workspaceHint(dashed, 2), "→ 3")
+assert.equal(Model.workspaceHint({}, 2), "", "a window with no workspace shows nothing")
+assert.equal(Model.workspaceHint(firefox, -1), "→ 2", "unknown current workspace still reports")
+console.log("workspace hint checks passed")
+
+// --- windowAt: resolving a click to a window ---
+// Hyprland reports no focus event when a window is clicked under an
+// exclusive-keyboard layer, so the switcher consumes the click and resolves the
+// target itself. Geometry comes from lastIpcObject.at / .size.
+function win(id, x, y, w, h, ws, rank) {
+  return { title: id, address: "0x" + id, workspace: { id: ws },
+           lastIpcObject: { class: id, at: [x, y], size: [w, h], focusHistoryID: rank } }
+}
+const back  = win("back",  0,   0,   800, 600, 2, 3)
+const front = win("front", 100, 100, 400, 300, 2, 0)   // overlaps back, focused later
+const other = win("other", 0,   0,   800, 600, 5, 1)   // different workspace
+
+assert.equal(Model.windowAt([back, front], 150, 150, 2).title, "front",
+  "overlapping windows resolve to the most recently focused, i.e. the visible one")
+assert.equal(Model.windowAt([back, front], 700, 550, 2).title, "back",
+  "a point outside the top window falls through to the one below")
+assert.equal(Model.windowAt([back, front], 900, 900, 2), null, "a point over no window is null")
+assert.equal(Model.windowAt([other], 10, 10, 2), null, "windows on other workspaces are not clickable")
+assert.equal(Model.windowAt([other], 10, 10, -1).title, "other", "unknown workspace does not filter")
+assert.equal(Model.windowAt([{ title: "ghost" }], 10, 10, 2), null, "a non-window toplevel is never a target")
+assert.equal(Model.windowAt([], 10, 10, 2), null)
+assert.equal(Model.windowAt(null, 10, 10, 2), null)
+console.log("windowAt checks passed")

@@ -71,6 +71,22 @@ Item {
   // in ~/.config/hypr/input.lua stops that.
   property bool mouseEnabled: true
   property bool hoverSelects: true
+
+  // clickSelects is OFF: clicking a row to focus it worked, but the window
+  // left under the pointer takes the active highlight the moment this overlay
+  // closes (input:follow_mouse + input:mouse_refocus), so the keyboard and the
+  // border disagree and it reads as a bug.
+  //
+  // Re-enabling it: turn this true AND let the pointer follow the focused
+  // window, so the window under the cursor IS the focused one and there is
+  // nothing to disagree about. In ~/.config/hypr/looknfeel.lua:
+  //
+  //   hl.config({ cursor = { no_warps = false } })
+  //
+  // Hover still selects with this off - point at a row and release the
+  // modifier - and SUPER+left-click is never borrowed, so it stays Omarchy's
+  // window drag even while the switcher is open.
+  property bool clickSelects: false
   property bool clickSelectsWindow: true
   property string filterText: ""
   property int selectedIndex: 0
@@ -404,7 +420,7 @@ Item {
   property real pointerY: 0
 
   function clickAt() {
-    if (!root.opened || !root.mouseEnabled) return "idle"
+    if (!root.opened || !root.mouseEnabled || !root.clickSelects) return "idle"
     if (root.pointerOverList) {
       // Hover has already selected the row under the pointer.
       root.focusSelected()
@@ -422,7 +438,7 @@ Item {
   // Omarchy's own dispatcher back, not a wrapper, so dragging windows behaves
   // exactly as it did before - the compositor owns the press again.
   function grabClickBinding(grab) {
-    if (!root.mouseEnabled && grab) return
+    if (grab && (!root.mouseEnabled || !root.clickSelects)) return
     var lua = grab
       // NOTE: no `{ mouse = true }` here. That flag is Hyprland's bindm, which
       // only drives drag dispatchers (move/resize) - an exec bound that way
@@ -524,7 +540,7 @@ Item {
         root.pointerY = mouse.y
       }
       onClicked: function(mouse) {
-        if (!root.mouseEnabled) return
+        if (!root.mouseEnabled || !root.clickSelects) return
         if (!root.clickSelectsWindow) return root.dismiss()
         // Panel coordinates -> compositor coordinates.
         var originX = panel.screen ? panel.screen.x : 0
@@ -676,7 +692,7 @@ Item {
                   if (root.hoverSelects && root.selectedIndex !== index) root.selectedIndex = index
                 }
                 onClicked: {
-                  if (!root.mouseEnabled) return
+                  if (!root.mouseEnabled || !root.clickSelects) return
                   root.selectedIndex = index
                   root.focusSelected()
                 }

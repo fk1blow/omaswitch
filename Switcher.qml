@@ -55,6 +55,22 @@ Item {
   // click, resolves the window under the pointer itself, focuses it and
   // closes. The trade-off is that the click does not also press whatever was
   // under it - it selects the window, like clicking a taskbar entry.
+  // ---- mouse toggles -------------------------------------------------------
+  // mouseEnabled     master switch. false = the switcher never touches the
+  //                  pointer: no hover, no click handling, and SUPER+left-click
+  //                  is never borrowed, so it stays Omarchy's window drag.
+  // hoverSelects     hovering a row moves the selection.
+  // clickSelectsWindow  a click outside the card focuses the window underneath
+  //                  instead of simply cancelling.
+  //
+  // Worth knowing when turning these on: with input:follow_mouse = 1 and
+  // input:mouse_refocus = true (both Omarchy defaults), the compositor marks
+  // whatever sits under the pointer as active the moment this overlay's layer
+  // is torn down - so the window under the cursor can take the highlight while
+  // the clicked window keeps the keyboard. Setting input:mouse_refocus = false
+  // in ~/.config/hypr/input.lua stops that.
+  property bool mouseEnabled: true
+  property bool hoverSelects: true
   property bool clickSelectsWindow: true
   property string filterText: ""
   property int selectedIndex: 0
@@ -388,7 +404,7 @@ Item {
   property real pointerY: 0
 
   function clickAt() {
-    if (!root.opened) return "idle"
+    if (!root.opened || !root.mouseEnabled) return "idle"
     if (root.pointerOverList) {
       // Hover has already selected the row under the pointer.
       root.focusSelected()
@@ -406,6 +422,7 @@ Item {
   // Omarchy's own dispatcher back, not a wrapper, so dragging windows behaves
   // exactly as it did before - the compositor owns the press again.
   function grabClickBinding(grab) {
+    if (!root.mouseEnabled && grab) return
     var lua = grab
       // NOTE: no `{ mouse = true }` here. That flag is Hyprland's bindm, which
       // only drives drag dispatchers (move/resize) - an exec bound that way
@@ -501,11 +518,13 @@ Item {
       anchors.fill: parent
       hoverEnabled: true
       onPositionChanged: function(mouse) {
+        if (!root.mouseEnabled) return
         root.pointerOverList = false
         root.pointerX = mouse.x
         root.pointerY = mouse.y
       }
       onClicked: function(mouse) {
+        if (!root.mouseEnabled) return
         if (!root.clickSelectsWindow) return root.dismiss()
         // Panel coordinates -> compositor coordinates.
         var originX = panel.screen ? panel.screen.x : 0
@@ -652,10 +671,12 @@ Item {
                 // initial selection - which is the whole point of a quick
                 // Super+Tab. Only an actual mouse movement counts.
                 onPositionChanged: {
+                  if (!root.mouseEnabled) return
                   root.pointerOverList = true
-                  if (root.selectedIndex !== index) root.selectedIndex = index
+                  if (root.hoverSelects && root.selectedIndex !== index) root.selectedIndex = index
                 }
                 onClicked: {
+                  if (!root.mouseEnabled) return
                   root.selectedIndex = index
                   root.focusSelected()
                 }

@@ -33,40 +33,86 @@ var titleSeparators = [" — ", " – ", " - ", " | "]
 // title and becomes the second row.
 //
 // The suffix is only stripped when it really is the application's name -
-// compared against the app id with punctuation and case removed - so a title
-// that merely contains a dash ("Bug 123 - fix the parser") is left intact.
-function splitTitle(window) {
+// compared against the app id, and against the desktop entry's name when the
+// switcher resolved one, with punctuation and case removed - so a title that
+// merely contains a dash ("Bug 123 - fix the parser") is left intact.
+//
+// Chromium web apps put the name at the FRONT instead ("(26) Discord |
+// Friends"), and their class ("chrome-discord.com__channels_@me-Default")
+// tokenizes to nothing that appears in the title, so the leading segment is
+// tried too. For those windows the desktop entry name is the only token that
+// can ever match, which is why it is passed in.
+//
+// Tokens shorter than three characters are dropped: substring matching against
+// "x" or "hey" hits inside half the words on screen.
+function appTokens(window, appName) {
+  var tokens = []
+  var idToken = normalized(String(appId(window)).split(".").pop())
+  if (idToken.length >= 3) tokens.push(idToken)
+  var nameToken = normalized(appName)
+  if (nameToken.length >= 3 && tokens.indexOf(nameToken) === -1) tokens.push(nameToken)
+  return tokens
+}
+
+function isAppSegment(segment, tokens) {
+  var token = normalized(segment)
+  if (token.length < 3) return false
+  for (var i = 0; i < tokens.length; i++)
+    if (token.indexOf(tokens[i]) !== -1 || tokens[i].indexOf(token) !== -1) return true
+  return false
+}
+
+function splitTitle(window, appName) {
   var title = String((window && window.title) || "")
   var result = { name: title, app: "" }
-  var idToken = normalized(String(appId(window)).split(".").pop())
-  if (!title || !idToken) return result
+  var tokens = appTokens(window, appName)
+  if (!title || tokens.length === 0) return result
 
   for (var i = 0; i < titleSeparators.length; i++) {
     var separator = titleSeparators[i]
-    var at = title.lastIndexOf(separator)
-    if (at <= 0) continue
-    var head = title.slice(0, at).trim()
-    var tail = title.slice(at + separator.length).trim()
-    if (!head || !tail || tail.length > 40) continue
-    var tailToken = normalized(tail)
-    if (!tailToken) continue
-    if (tailToken.indexOf(idToken) === -1 && idToken.indexOf(tailToken) === -1) continue
-    result.name = head
-    result.app = tail
-    return result
+
+    // "Report - Mozilla Firefox": the name trails.
+    var last = title.lastIndexOf(separator)
+    if (last > 0) {
+      var head = title.slice(0, last).trim()
+      var tail = title.slice(last + separator.length).trim()
+      if (head && tail && tail.length <= 40 && isAppSegment(tail, tokens)) {
+        result.name = head
+        result.app = tail
+        return result
+      }
+    }
+
+    // "(26) Discord | Friends": the name leads.
+    var first = title.indexOf(separator)
+    if (first > 0) {
+      var lead = title.slice(0, first).trim()
+      var rest = title.slice(first + separator.length).trim()
+      if (lead && rest && lead.length <= 40 && isAppSegment(lead, tokens)) {
+        result.name = rest
+        result.app = lead
+        return result
+      }
+    }
   }
   return result
 }
 
-function label(window) {
-  var parts = splitTitle(window)
-  return boundedText(parts.name || prettyAppId(window) || "Untitled")
+function label(window, appName) {
+  var parts = splitTitle(window, appName)
+  return boundedText(parts.name || appName || prettyAppId(window) || "Untitled")
 }
 
-function detail(window) {
+// Row two is the application's own name. The desktop entry's Name wins when
+// the switcher resolved one - it is the only thing that names a Chromium web
+// app, whose class is a mangled URL - then the suffix split off the title, then
+// the app id. Blank when it would only repeat row one: "Steam / Steam" is noise.
+function detail(window, appName) {
   if (!window) return ""
-  var parts = splitTitle(window)
-  return boundedText(parts.app || prettyAppId(window))
+  var parts = splitTitle(window, appName)
+  var value = boundedText(String(appName || "") || parts.app || prettyAppId(window))
+  if (normalized(value) && normalized(value) === normalized(label(window, appName))) return ""
+  return value
 }
 
 // A workspace number on every row is noise: most windows sit on the one you are
@@ -204,6 +250,106 @@ function focusCommand(window) {
   return "{ " + lua + " ; } >/dev/null 2>&1 || { " + legacy + " ; } >/dev/null 2>&1"
 }
 
+// ---------------------------------------------------------------------------
+// Reducing an app id to something a desktop entry can be found under.
+//
+// A Wayland app id is SUPPOSED to be the entry id. In practice it is whatever
+// the toolkit felt like emitting:
+//
+//   firefox                                    the entry id, as promised
+//   com.transmissionbt.transmission_58_931770  GTK appends an instance suffix
+//   org.gnome.Nautilus                         reverse-DNS; the entry is nautilus
+//   chrome-discord.com__channels_@me-Default   Chromium mangles the --app= URL
+//
+// These are pure string reductions and live here rather than in Switcher.qml so
+// they can be tested: this is the part that grows every time a toolkit invents
+// a new way to spell a name, and it is the part nothing else can check.
+// ---------------------------------------------------------------------------
+
+// Toolkit and packaging suffixes that turn up on one side of a match and not
+// the other: the entry is transmission-gtk, the window says transmission.
+var variantSuffix = /-(gtk[0-9]*|qt[0-9]*|x11|wayland|bin|git|stable|beta|nightly|dev|desktop|app)$/
+// GTK's per-instance suffix: com.transmissionbt.transmission_58_931770.
+var instanceSuffix = /([._-]\d+)+$/
+
+// The comparison form for every key and every candidate. Case and punctuation
+// carry no information here, and dropping them is what makes "transmission-gtk",
+// "Transmission GTK" and "transmissiongtk" one key.
+function flatten(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "")
+}
+
+// "org.gnome.Nautilus" -> "Nautilus". Empty when there is nothing to strip.
+function dotTail(value) {
+  var parts = String(value || "").split(".")
+  return parts.length > 1 ? parts[parts.length - 1] : ""
+}
+
+function stripVariant(value) {
+  return String(value || "").replace(variantSuffix, "")
+}
+
+// "transmission-gtk %U" -> "transmission-gtk", "/usr/bin/foo --bar" -> "foo".
+function execProgram(exec) {
+  var first = String(exec || "").trim().split(/\s+/)[0] || ""
+  var slash = first.lastIndexOf("/")
+  return slash >= 0 ? first.slice(slash + 1) : first
+}
+
+// The flattened host and path of the URL an Exec= line opens, or "" when it
+// opens no URL. Chromium builds a --app= window's class out of exactly this, so
+// it is what a web app is looked up under.
+function execUrlKey(exec) {
+  var url = String(exec || "").match(/https?:\/\/[^\s"']+/)
+  if (!url) return ""
+  var key = flatten(url[0].replace(/^https?:\/\//i, ""))
+  return key.length >= 4 ? key : ""
+}
+
+// The flattened spellings of one app id worth looking up, most faithful first:
+//
+//   com.transmissionbt.transmission_58_931770   as reported
+//   com.transmissionbt.transmission             minus the instance suffix
+//   transmission                                minus the reverse-DNS prefix
+//   transmission                                minus a toolkit suffix
+//
+// Anything under three characters is dropped: at that length a key collides
+// more often than it identifies.
+function appIdCandidates(id) {
+  var out = []
+  var push = function(value) {
+    var key = flatten(value)
+    if (key.length >= 3 && out.indexOf(key) === -1) out.push(key)
+  }
+  var raw = String(id || "").trim()
+  var stripped = raw.replace(instanceSuffix, "")
+  var tail = dotTail(stripped)
+  push(raw)
+  push(stripped)
+  push(tail)
+  push(stripVariant(tail || stripped))
+  return out
+}
+
+// The same reduction for ICON names, which keep their punctuation - an icon
+// really is installed as "com.mitchellh.ghostty.png". Used when an app ships an
+// icon named after its own class and no desktop entry at all.
+function iconNameCandidates(id) {
+  var out = []
+  var push = function(value) {
+    var name = String(value || "").trim()
+    if (name && out.indexOf(name) === -1) out.push(name)
+  }
+  var raw = String(id || "").trim()
+  var stripped = raw.replace(instanceSuffix, "")
+  var tail = dotTail(stripped)
+  push(raw)
+  push(stripped)
+  push(tail)
+  push(stripVariant(tail || stripped))
+  return out
+}
+
 if (typeof module !== "undefined") module.exports = {
   appId: appId,
   label: label,
@@ -216,5 +362,12 @@ if (typeof module !== "undefined") module.exports = {
   windowAt: windowAt,
   sortedWindows: sortedWindows,
   filteredWindows: filteredWindows,
-  focusCommand: focusCommand
+  focusCommand: focusCommand,
+  flatten: flatten,
+  dotTail: dotTail,
+  stripVariant: stripVariant,
+  execProgram: execProgram,
+  execUrlKey: execUrlKey,
+  appIdCandidates: appIdCandidates,
+  iconNameCandidates: iconNameCandidates
 }

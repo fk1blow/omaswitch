@@ -149,68 +149,205 @@ Item {
   readonly property int cornerRadius: Style.cornerRadius
   property string fontFamily: Style.font.menuFamily
 
-  // Application icons. The window gives us an app id ("firefox",
-  // "com.mitchellh.ghostty"); the desktop entry for it gives the icon NAME,
-  // which the shell's AppLibrary then resolves to a file (it keeps an index for
-  // icons installed after this process started, and falls back to a generic
-  // executable icon). Both lookups are cached: this runs per delegate, per
-  // repaint.
+  // Application icons. The window gives an app id ("firefox",
+  // "com.mitchellh.ghostty"); the desktop entry found for it gives the icon
+  // NAME, which the icon theme then resolves to a file. Every step is cached -
+  // a delegate binding must never do this work, it runs per row per repaint.
   property bool showIcons: true
-  property int iconSize: Math.max(16, Math.round(root.rowHeight * 0.62) - 12)
-  property var entryIndex: null
+  // 0.62 of the row less a fixed inset. The inset is 8 rather than the 12 the
+  // ratio was tuned against: four pixels more icon, which is what the row can
+  // spare without crowding the two text lines.
+  property int iconSize: Math.max(16, Math.round(root.rowHeight * 0.62) - 8)
+  // ---------------------------------------------------------------------------
+  // Matching a window to its desktop entry.
+  //
+  // A Wayland app id is SUPPOSED to be the entry id. In practice it is whatever
+  // the toolkit felt like emitting:
+  //
+  //   firefox                                    the entry id, as promised
+  //   com.transmissionbt.transmission_58_931770  GTK appends an instance suffix
+  //   org.gnome.Nautilus                         reverse-DNS; the entry is nautilus
+  //   chrome-discord.com__channels_@me-Default   Chromium mangles the --app= URL
+  //
+  // Special-casing each one is a losing game, so instead every entry is indexed
+  // under several keys grouped by how much the key is worth, and the app id is
+  // reduced to a few candidate spellings (Model.appIdCandidates, which is where
+  // the mangling is documented and tested). A whole tier is tried against every
+  // candidate before the next tier, so a desperate guess can never outrank a
+  // solid match:
+  //
+  //   exactIndex   StartupWMClass, the entry id      an app that declares itself
+  //   namedIndex   the entry's display name          "Transmission"
+  //   binaryIndex  the Exec= program name            "transmission-gtk"
+  //   webappIndex  the Exec= URL, prefix-matched     Chromium web apps
+  //
+  // ---------------------------------------------------------------------------
+  property var exactIndex: null
+  property var namedIndex: null
+  property var binaryIndex: null
+  property var webappIndex: null
   property var iconCache: ({})
+  // appId -> the desktop entry's own Name, for row two. Same discipline as
+  // iconCache: written only by rebuildAppInfo(), only read from delegates.
+  property var nameCache: ({})
 
-  function desktopEntryFor(id) {
-    if (root.entryIndex === null) {
-      var index = ({})
-      try {
-        var values = (DesktopEntries.applications && DesktopEntries.applications.values) || []
-        for (var i = 0; i < values.length; i++) {
-          var entry = values[i]
-          if (!entry) continue
-          var keys = [entry.id, entry.name, entry.startupClass]
-          for (var k = 0; k < keys.length; k++) {
-            var key = String(keys[k] || "").toLowerCase().replace(/\.desktop$/, "")
-            if (key && index[key] === undefined) index[key] = entry
-          }
-        }
-      } catch (e) {
-        // A Quickshell without DesktopEntries just means no icons.
-      }
-      root.entryIndex = index
+  // Exec= programs that launch something ELSE. Indexing these would hand the
+  // key "steam" to whichever Steam game .desktop happened to be enumerated
+  // first, and "flatpak" to a coin toss.
+  readonly property var passthroughBinaries: ({
+    sh: true, bash: true, zsh: true, env: true, exec: true,
+    python: true, python3: true, perl: true, ruby: true, node: true,
+    flatpak: true, snap: true, wine: true, proton: true, java: true,
+    steam: true, gtklaunch: true, uwsmapp: true, xdgopen: true,
+    omarchylaunchwebapp: true
+  })
+
+  function buildIndexes() {
+    var exact = ({})
+    var named = ({})
+    var binary = ({})
+    var webapps = []
+    var add = function(index, value, entry) {
+      var key = Model.flatten(value)
+      if (key.length >= 3 && index[key] === undefined) index[key] = entry
     }
-    var want = String(id || "").toLowerCase().replace(/\.desktop$/, "")
-    if (!want) return null
-    return root.entryIndex[want] || root.entryIndex[want.split(".").pop()] || null
+    try {
+      var values = (DesktopEntries.applications && DesktopEntries.applications.values) || []
+      for (var i = 0; i < values.length; i++) {
+        var entry = values[i]
+        if (!entry) continue
+
+        var startup = String(entry.startupClass || "")
+        var id = String(entry.id || "").replace(/\.desktop$/i, "")
+        add(exact, startup, entry)
+        add(exact, Model.dotTail(startup), entry)
+        add(exact, id, entry)
+        add(exact, Model.dotTail(id), entry)
+
+        add(named, entry.name, entry)
+
+        var exec = String(entry.execString || "")
+        var program = Model.execProgram(exec)
+        if (program && !root.passthroughBinaries[Model.flatten(program)]) {
+          add(binary, program, entry)
+          add(binary, Model.stripVariant(program), entry)
+        }
+
+        // Chromium --app= windows are named after the URL, not after any entry,
+        // so nothing above can ever match them. Omarchy launches web apps as
+        // "omarchy-launch-webapp https://discord.com/channels/@me", and flattening
+        // that URL gives a PREFIX of the equally flattened class - the class only
+        // adds the Chromium profile ("-Default"). Longest key first, because
+        // several entries share a host: maps.google.com must beat google.com.
+        var webKey = Model.execUrlKey(exec)
+        if (webKey) webapps.push({ key: webKey, entry: entry })
+      }
+    } catch (e) {
+      // A Quickshell without DesktopEntries just means no icons.
+    }
+    webapps.sort(function(a, b) { return b.key.length - a.key.length })
+    root.exactIndex = exact
+    root.namedIndex = named
+    root.binaryIndex = binary
+    root.webappIndex = webapps
   }
 
-  function resolveIcon(id) {
-    var entry = root.desktopEntryFor(id)
-    var name = entry && entry.icon ? String(entry.icon) : String(id)
+  function lookup(index, candidates) {
+    if (!index) return null
+    for (var i = 0; i < candidates.length; i++)
+      if (index[candidates[i]]) return index[candidates[i]]
+    return null
+  }
+
+  function webappEntryFor(id) {
+    if (root.webappIndex === null) return null
+    if (!/^(chrome|chromium|brave|vivaldi|msedge|opera|helium)-/.test(id)) return null
+    var flat = Model.flatten(id.replace(/^[a-z]+-/, ""))
+    if (!flat) return null
+    for (var i = 0; i < root.webappIndex.length; i++)
+      if (flat.indexOf(root.webappIndex[i].key) === 0) return root.webappIndex[i].entry
+    return null
+  }
+
+  function desktopEntryFor(id) {
+    if (root.exactIndex === null) root.buildIndexes()
+    var want = String(id || "").toLowerCase().replace(/\.desktop$/i, "")
+    if (!want) return null
+    var candidates = Model.appIdCandidates(want)
+    return root.lookup(root.exactIndex, candidates)
+      || root.lookup(root.namedIndex, candidates)
+      || root.lookup(root.binaryIndex, candidates)
+      || root.webappEntryFor(want)
+      || null
+  }
+
+  // Qt's themed lookup goes first and shell.appLibrary is only the fallback -
+  // the reverse of what it looks like it should be. appLibrary consults its own
+  // index before the theme, and that index is built by a find(1) that keeps the
+  // FIRST hit per icon name with no size preference beyond svg-before-png. For
+  // Steam that is hicolor/16x16/apps/steam.png, upscaled into a smudge, where
+  // the theme hands over the 256x256 file. appLibrary is still worth asking
+  // second: it sees icons installed after this process started, which Qt's icon
+  // cache never rescans.
+  function themedIcon(name) {
+    var value = String(name || "")
+    if (!value) return ""
     try {
-      return root.shell && root.shell.appLibrary
-        ? String(root.shell.appLibrary.iconSource(name) || "")
-        : String(Quickshell.iconPath(name, true) || "")
+      var themed = String(Quickshell.iconPath(value, true) || "")
+      if (themed) return themed
     } catch (e) {
+      // Fall through to appLibrary.
+    }
+    try {
+      if (!root.shell || !root.shell.appLibrary) return ""
+      var viaLibrary = String(root.shell.appLibrary.iconSource(value) || "")
+      // appLibrary answers a miss with the generic executable icon rather than
+      // with nothing, which would end the search on the first name tried.
+      return viaLibrary.indexOf("application-x-executable") === -1 ? viaLibrary : ""
+    } catch (e2) {
       return ""
     }
   }
 
-  // Resolved once per refresh, never from inside a delegate binding: reading
-  // and writing the cache during binding evaluation is a binding loop.
-  // Delegates only ever read the finished map.
-  function rebuildIcons() {
-    if (!root.showIcons) { root.iconCache = ({}); return }
-    var next = ({})
+  // The entry's Icon= is the answer whenever there is an entry, but plenty of
+  // apps ship an icon named after their own class and no matching entry at all,
+  // so the app id is tried in the same reduced spellings the entry lookup used.
+  //
+  // A miss returns nothing rather than the generic executable icon. That icon is
+  // a grey gear - it reads as "Settings", and two apps that both fail to resolve
+  // would come out looking like the same app. The row holds the icon slot open
+  // either way, so the column stays straight without painting a wrong answer.
+  function resolveIcon(entry, id) {
+    var names = Model.iconNameCandidates(id)
+    if (entry && entry.icon) names.unshift(String(entry.icon))
+
+    for (var i = 0; i < names.length; i++) {
+      var found = root.themedIcon(names[i])
+      if (found) return found
+    }
+    return ""
+  }
+
+  function rebuildAppInfo() {
+    var nextIcons = ({})
+    var nextNames = ({})
     var changed = false
     for (var i = 0; i < root.allWindows.length; i++) {
       var id = Model.appId(root.allWindows[i])
-      if (!id || next[id] !== undefined) continue
-      next[id] = root.iconCache[id] !== undefined ? root.iconCache[id] : root.resolveIcon(id)
+      if (!id || nextNames[id] !== undefined) continue
+      var entry = root.desktopEntryFor(id)
+      nextNames[id] = entry && entry.name ? String(entry.name) : ""
+      if (root.nameCache[id] !== nextNames[id]) changed = true
+      if (!root.showIcons) continue
+      nextIcons[id] = root.iconCache[id] !== undefined ? root.iconCache[id] : root.resolveIcon(entry, id)
       if (root.iconCache[id] === undefined) changed = true
     }
-    for (var key in root.iconCache) if (next[key] === undefined) changed = true
-    if (changed) root.iconCache = next
+    for (var key in root.iconCache) if (nextIcons[key] === undefined) changed = true
+    for (var named in root.nameCache) if (nextNames[named] === undefined) changed = true
+    if (changed) {
+      root.iconCache = nextIcons
+      root.nameCache = nextNames
+    }
   }
 
   // keepSelection: follow the selected WINDOW across a rebuild rather than
@@ -272,7 +409,7 @@ Item {
         if (kept.indexOf(sorted[j]) === -1) kept.push(sorted[j])
       root.allWindows = kept
     }
-    rebuildIcons()
+    rebuildAppInfo()
     rebuildRows(keepSelection === true)
   }
 
@@ -469,9 +606,13 @@ Item {
     target: DesktopEntries.applications
     ignoreUnknownSignals: true
     function onValuesChanged() {
-      root.entryIndex = null
+      root.exactIndex = null
+      root.namedIndex = null
+      root.binaryIndex = null
+      root.webappIndex = null
       root.iconCache = ({})
-      if (root.opened) root.rebuildIcons()
+      root.nameCache = ({})
+      if (root.opened) root.rebuildAppInfo()
     }
   }
 
@@ -603,6 +744,7 @@ Item {
             delegate: Item {
               required property var modelData
               required property int index
+              readonly property string appName: root.nameCache[Model.appId(modelData)] || ""
               width: listView.width
               height: root.rowHeight
 
@@ -646,15 +788,18 @@ Item {
 
               Column {
                 anchors.verticalCenter: parent.verticalCenter
-                anchors.left: rowIcon.visible ? rowIcon.right : parent.left
+                // The slot is held for as long as icons are on at all, not per
+                // row: one app the resolver could not place must not drag its
+                // own row's text out of the column.
+                anchors.left: root.showIcons ? rowIcon.right : parent.left
                 anchors.leftMargin: Style.space(10)
                 width: parent.width - Style.space(20)
-                  - (rowIcon.visible ? rowIcon.width + Style.space(10) : 0)
+                  - (root.showIcons ? rowIcon.width + Style.space(10) : 0)
                   - (rowWorkspace.visible ? rowWorkspace.width + Style.space(10) : 0)
                 spacing: 2
 
                 Text {
-                  text: Model.label(modelData)
+                  text: Model.label(modelData, appName)
                   textFormat: Text.PlainText
                   color: index === root.selectedIndex ? root.selectedText : root.foreground
                   font.family: root.fontFamily
@@ -663,7 +808,8 @@ Item {
                   width: parent.width
                 }
                 Text {
-                  text: Model.detail(modelData)
+                  text: Model.detail(modelData, appName)
+                  visible: text !== ""
                   textFormat: Text.PlainText
                   color: index === root.selectedIndex ? root.selectedText : root.foreground
                   opacity: 0.6

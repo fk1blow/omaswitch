@@ -12,7 +12,95 @@ assert.deepEqual(Model.filteredWindows([active, previous, old], "foot"), [previo
 assert.deepEqual(Model.filteredWindows([active, previous, old], "notes"), [old])
 assert.equal(Model.detail(old), "Obsidian")
 assert.equal(Model.label({ title: "x".repeat(161) }), "x".repeat(159) + "…")
-assert.equal(Model.detail({ wayland: { appId: "x".repeat(161) } }), "X" + "x".repeat(158) + "…")
+assert.equal(Model.detail({ title: "Session", wayland: { appId: "x".repeat(161) } }), "X" + "x".repeat(158) + "…")
+
+// --- the two text rows ---
+// Row one is the window, row two is the application. Three things decide them:
+// where the app name sits in the title, whether a desktop entry named the app,
+// and whether the two rows would end up saying the same thing.
+
+// Trailing app name, the common case - unchanged by the app-name parameter.
+const ffTitle = { title: "Babel (2006) - IMDb — Mozilla Firefox", wayland: { appId: "firefox" } }
+assert.equal(Model.label(ffTitle), "Babel (2006) - IMDb")
+assert.equal(Model.detail(ffTitle), "Mozilla Firefox")
+assert.equal(Model.detail(ffTitle, "Firefox"), "Firefox")
+
+// Chromium web app: the class is a mangled URL, so without the desktop entry
+// name there is no token in common with the title and nothing can be split.
+const discord = { title: "(26) Discord | Friends", wayland: { appId: "chrome-discord.com__channels_@me-Default" } }
+assert.equal(Model.label(discord), "(26) Discord | Friends")
+// With it, the LEADING segment is recognised as the app name and moves to row two.
+assert.equal(Model.label(discord, "Discord"), "Friends")
+assert.equal(Model.detail(discord, "Discord"), "Discord")
+
+// A dash in a title is not an app name.
+const bug = { title: "Bug 123 - fix the parser", wayland: { appId: "firefox" } }
+assert.equal(Model.label(bug, "Firefox"), "Bug 123 - fix the parser")
+assert.equal(Model.detail(bug, "Firefox"), "Firefox")
+
+// Row two is dropped when it would only repeat row one.
+const steam = { title: "Steam", wayland: { appId: "steam" } }
+assert.equal(Model.label(steam, "Steam"), "Steam")
+assert.equal(Model.detail(steam, "Steam"), "")
+
+// Tokens under three characters are never matched: "x" appears inside "Firefox".
+const shortName = { title: "Timeline - Home", wayland: { appId: "chrome-x.com__-Default" } }
+assert.equal(Model.label(shortName, "X"), "Timeline - Home")
+assert.equal(Model.detail(shortName, "X"), "X")
+
+// --- reducing an app id to something a desktop entry can be found under ---
+// The four classes that motivated the reduction, each with the spelling that has
+// to come out of it for the lookup in Switcher.qml to land.
+
+// Already the entry id: nothing to reduce, and no empty or duplicate candidates.
+assert.deepEqual(Model.appIdCandidates("firefox"), ["firefox"])
+
+// GTK's per-instance suffix, then the reverse-DNS prefix.
+assert.deepEqual(
+  Model.appIdCandidates("com.transmissionbt.transmission_58_931770"),
+  ["comtransmissionbttransmission58931770", "comtransmissionbttransmission", "transmission"])
+
+// Reverse-DNS alone. "org.gnome.Nautilus" must reach the entry id "nautilus".
+assert.ok(Model.appIdCandidates("org.gnome.Nautilus").indexOf("nautilus") !== -1)
+
+// A toolkit suffix on the window side rather than the entry side.
+assert.ok(Model.appIdCandidates("foo-qt6").indexOf("foo") !== -1)
+
+// Under three characters is dropped rather than offered as a candidate.
+assert.deepEqual(Model.appIdCandidates("qb"), [])
+assert.deepEqual(Model.appIdCandidates(""), [])
+
+// Icon names keep their punctuation - the file really is com.mitchellh.ghostty.png.
+assert.deepEqual(
+  Model.iconNameCandidates("com.mitchellh.ghostty"),
+  ["com.mitchellh.ghostty", "ghostty"])
+assert.deepEqual(
+  Model.iconNameCandidates("com.transmissionbt.transmission_58_931770"),
+  ["com.transmissionbt.transmission_58_931770", "com.transmissionbt.transmission", "transmission"])
+
+assert.equal(Model.flatten("Transmission-GTK"), "transmissiongtk")
+assert.equal(Model.dotTail("org.gnome.Nautilus"), "Nautilus")
+assert.equal(Model.dotTail("firefox"), "")
+assert.equal(Model.stripVariant("transmission-gtk"), "transmission")
+assert.equal(Model.stripVariant("firefox"), "firefox")
+
+// Exec= is a command line, not a program name.
+assert.equal(Model.execProgram("transmission-gtk %U"), "transmission-gtk")
+assert.equal(Model.execProgram("/usr/bin/steam-runtime %U"), "steam-runtime")
+assert.equal(Model.execProgram(""), "")
+
+// A web app is looked up under the URL its Exec= opens, flattened the same way
+// Chromium flattens it into the window class.
+assert.equal(
+  Model.execUrlKey("omarchy-launch-webapp https://discord.com/channels/@me"),
+  "discordcomchannelsme")
+// ... and that key is a PREFIX of the class Chromium then produces.
+assert.equal(
+  Model.flatten("discord.com__channels_@me-Default")
+    .indexOf(Model.execUrlKey("omarchy-launch-webapp https://discord.com/channels/@me")),
+  0)
+// Entries that open no URL contribute no web-app key.
+assert.equal(Model.execUrlKey("transmission-gtk %U"), "")
 
 // --- focusCommand: switching to windows on other workspaces ---
 // Reproduces the bug: confirming a selection previously used the native

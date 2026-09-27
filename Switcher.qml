@@ -72,21 +72,14 @@ Item {
   property bool mouseEnabled: true
   property bool hoverSelects: true
 
-  // clickSelects is OFF: clicking a row to focus it worked, but the window
-  // left under the pointer takes the active highlight the moment this overlay
-  // closes (input:follow_mouse + input:mouse_refocus), so the keyboard and the
-  // border disagree and it reads as a bug.
-  //
-  // Re-enabling it: turn this true AND let the pointer follow the focused
-  // window, so the window under the cursor IS the focused one and there is
-  // nothing to disagree about. In ~/.config/hypr/looknfeel.lua:
-  //
-  //   hl.config({ cursor = { no_warps = false } })
-  //
-  // Hover still selects with this off - point at a row and release the
-  // modifier - and SUPER+left-click is never borrowed, so it stays Omarchy's
-  // window drag even while the switcher is open.
-  property bool clickSelects: false
+  // Click-to-focus is ON: clicking a row focuses that window and closes the
+  // switcher, no modifier release needed. The window under the pointer would
+  // otherwise steal the active highlight as this exclusive-keyboard layer is
+  // torn down (input:follow_mouse = 1 + input:mouse_refocus = true, both
+  // Omarchy defaults) — see the comment above mouseEnabled. The fix is
+  // input:mouse_refocus = false in ~/.config/hypr/input.lua, which keeps
+  // no_warps = true (cursor stays put during keyboard cycling).
+  property bool clickSelects: true
   property bool clickSelectsWindow: true
   property string filterText: ""
   property int selectedIndex: 0

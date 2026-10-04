@@ -420,7 +420,12 @@ Item {
     root.pendingCommand = Model.focusCommand(window) || ""
     root.pendingWindow = window
     root.dismiss()
-    focusTimer.restart()
+  }
+
+  // Every way out of the switcher goes through here, so a focus held over by
+  // open() is never dropped - whether this session committed a new one or not.
+  function flushPendingFocus() {
+    if (root.pendingCommand || root.pendingWindow) focusTimer.restart()
   }
 
   Timer {
@@ -455,7 +460,6 @@ Item {
     root.pendingCommand = Model.focusCommand(target) || ""
     root.pendingWindow = target
     root.dismiss()
-    focusTimer.restart()
   }
 
   function select(delta) {
@@ -475,6 +479,15 @@ Item {
       return
     }
 
+    // A switch committed less than focusTimer.interval ago has not been
+    // dispatched yet. Left running, it would fire in the middle of this summon:
+    // the focus dispatch pulls the keyboard away from the overlay as it maps,
+    // the modifier release is never seen, and a quick tap ends up revealing the
+    // list. Hold it instead - this summon's own commit supersedes it, and a
+    // cancel dispatches it on the way out (see dismiss()).
+    var carried = focusTimer.running ? root.pendingWindow : null
+    focusTimer.stop()
+
     root.opened = true
     root.cycleMode = payload.mode === "cycle"
     var requested = Number(payload.revealDelay)
@@ -488,6 +501,17 @@ Item {
     root.allWindows = []          // a fresh summon re-sorts by MRU
     root.rows = []                // ... and does not inherit the old selection
     root.refresh(false)
+    // Hyprland still ranks the window we were on before that switch first,
+    // because the switch never reached it. Rank it the way the user sees it,
+    // so a quick tap goes back where they came from.
+    var at = carried ? root.allWindows.indexOf(carried) : -1
+    if (at > 0) {
+      var reordered = root.allWindows.slice()
+      reordered.splice(at, 1)
+      reordered.unshift(carried)
+      root.allWindows = reordered
+      root.rebuildRows(false)
+    }
     root.captureCurrentWorkspace()
     root.pointerOverList = false
     root.grabClickBinding(true)
@@ -508,6 +532,7 @@ Item {
     root.cycleMode = false
     root.revealed = false
     revealTimer.stop()
+    root.flushPendingFocus()
   }
 
   // User-initiated dismissal also drops the host's openPanelIds entry.
@@ -517,6 +542,7 @@ Item {
     root.cycleMode = false
     root.revealed = false
     revealTimer.stop()
+    root.flushPendingFocus()
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "piyush.omaswitch")
   }

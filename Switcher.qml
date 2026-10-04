@@ -639,9 +639,8 @@ Item {
   Connections {
     target: Hyprland
     function onRawEvent(event) {
-      var name = event ? String(event.name || "") : ""
-      if (name.indexOf("activewindow") === 0 || name === "openlayer")
       if (!root.opened) return
+      var name = event ? String(event.name || "") : ""
 
       if (name === "activewindow" || name === "closewindow" || name === "openwindow" ||
           name === "workspace" || name === "movewindow" || name.indexOf("windowtitle") === 0) {

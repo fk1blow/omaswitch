@@ -227,3 +227,68 @@ assert.equal(Model.windowAt([{ title: "ghost" }], 10, 10, 2), null, "a non-windo
 assert.equal(Model.windowAt([], 10, 10, 2), null)
 assert.equal(Model.windowAt(null, 10, 10, 2), null)
 console.log("windowAt checks passed")
+
+// --- live focus order (focusHistoryID is a startup snapshot) ---
+// Quickshell reads focusHistoryID only at startup and on config reload. After
+// A -> B -> C the snapshot still ranks A first, so the switcher keeps its own
+// most-recent-first list from live activations and that list wins.
+const winA = { title: "A", address: "0xa", workspace: { id: 1 }, activated: false, lastIpcObject: { focusHistoryID: 0 } }
+const winB = { title: "B", address: "0xb", workspace: { id: 1 }, activated: false, lastIpcObject: { focusHistoryID: 1 } }
+const winC = { title: "C", address: "0xc", workspace: { id: 1 }, activated: true, lastIpcObject: { focusHistoryID: 2 } }
+const winD = { title: "D", address: "0xd", workspace: { id: 1 }, activated: false, lastIpcObject: { focusHistoryID: 3 } }
+let order = []
+order = Model.notedFocus(order, winA)
+order = Model.notedFocus(order, winB)
+order = Model.notedFocus(order, winC)
+const titles = function(list) { return list.map(function(w) { return w.title }) }
+assert.deepEqual(titles(order), ["C", "B", "A"])
+assert.deepEqual(titles(Model.sortedWindows([winA, winB, winC, winD], order)), ["C", "B", "A", "D"],
+  "live focus order must beat the stale snapshot; unobserved windows follow by snapshot rank")
+// Without a focus order (shell just started) the snapshot decides - and shows
+// the bug: stale rank 0 makes A tie the active window and sort above it.
+assert.deepEqual(titles(Model.sortedWindows([winA, winB, winC, winD])), ["A", "C", "B", "D"],
+  "without a focus order the snapshot still decides (startup)")
+assert.deepEqual(titles(Model.notedFocus([winA, null, winB], winB)), ["B", "A"], "re-focus moves to front, nulls dropped")
+assert.equal(Model.notedFocus([winA, winB, winC], winD, 2).length, 2, "focus order is capped")
+
+assert.equal(Model.wrapIndex(0, 1, 3), 1)
+assert.equal(Model.wrapIndex(0, -1, 3), 2)
+assert.equal(Model.wrapIndex(1, -5, 3), 2, "large negative steps must wrap, not go negative")
+assert.equal(Model.wrapIndex(0, 1, 0), 0)
+
+// --- Super+Tab sessions: every arrival order must end closed ---
+// Each summon and release is its own omarchy-shell process, so the release of
+// a quick tap often arrives before its own summon. Previously the overlay only
+// learned of the release by receiving the Super key-up itself, which it misses
+// whenever Super is let go before it has keyboard focus: the switcher stayed
+// up, and the next Super+Tab counted as a second step of the dead session.
+const closed = { opened: false, session: 0, endedSession: 0, releasedSession: 0 }
+
+// Normal hold: summon, (more steps), release.
+assert.deepEqual(Model.summonAction(closed, 1), { action: "open", commitPrevious: false, commitNow: false })
+const showing1 = { opened: true, session: 1, endedSession: 0, releasedSession: 0 }
+assert.equal(Model.summonAction(showing1, 1).action, "step", "another Tab of the session on screen steps")
+assert.equal(Model.releaseCommits(showing1, 1), true, "its release commits it")
+
+// Quick tap, release first: the release is remembered, the summon commits at once.
+assert.equal(Model.releaseCommits(closed, 1), false, "a release for a session not on screen commits nothing")
+assert.deepEqual(Model.summonAction({ opened: false, session: 0, endedSession: 0, releasedSession: 1 }, 1),
+  { action: "open", commitPrevious: false, commitNow: true }, "a summon after its own release opens and commits")
+
+// Quick tap then Super+Tab again before the first release arrived: the old
+// session must be committed, never stepped (the 'wrong app' bug).
+assert.deepEqual(Model.summonAction(showing1, 2), { action: "open", commitPrevious: true, commitNow: false },
+  "a new session's summon commits the one still on screen instead of stepping it")
+assert.equal(Model.releaseCommits({ opened: true, session: 2, endedSession: 1, releasedSession: 0 }, 1), false,
+  "a late release of the previous session does not commit the new one")
+
+// A step of session 1 delivered after session 1 already closed on release.
+assert.equal(Model.summonAction({ opened: false, session: 0, endedSession: 1, releasedSession: 1 }, 1).action, "ignore",
+  "a late press of a released session must not reopen a switcher nothing will close")
+assert.equal(Model.summonAction({ opened: true, session: 3, endedSession: 2, releasedSession: 2 }, 1).action, "ignore",
+  "presses of older sessions are ignored")
+
+// Escape while Super is still held, then Tab again: same session, not released.
+assert.equal(Model.summonAction({ opened: false, session: 0, endedSession: 1, releasedSession: 0 }, 1).action, "open",
+  "Tab after Escape with Super still held reopens")
+console.log("session checks passed")

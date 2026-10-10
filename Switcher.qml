@@ -364,7 +364,7 @@ Item {
     root.currentWorkspaceId = isFinite(id) ? id : -1
   }
 
-  Component.onDestruction: if (root.opened) root.grabClickBinding(false)
+  Component.onDestruction: if (root.clickBindingApplied !== false) root.applyClickBinding(false)
 
   function rebuildRows(keepSelection) {
     var previous = keepSelection ? (rows[selectedIndex] || null) : null
@@ -386,8 +386,24 @@ Item {
     rebuildRows(false)
   }
 
+  // Most-recent-first, from live activations - see Model.focusRank() for why
+  // focusHistoryID cannot be trusted. Tracked while closed too: that is when
+  // focus moves. One short array per focus change, unlike refresh().
+  property var focusOrder: []
+
+  function noteFocus(window) {
+    if (window) root.focusOrder = Model.notedFocus(root.focusOrder, window)
+  }
+
+  Component.onCompleted: root.noteFocus(Hyprland.activeToplevel)
+
+  Connections {
+    target: Hyprland
+    function onActiveToplevelChanged() { root.noteFocus(Hyprland.activeToplevel) }
+  }
+
   function refresh(keepSelection) {
-    var sorted = Model.sortedWindows(Hyprland.toplevels.values)
+    var sorted = Model.sortedWindows(Hyprland.toplevels.values, root.focusOrder)
     if (!root.opened || root.allWindows.length === 0) {
       root.allWindows = sorted
     } else {
@@ -464,16 +480,117 @@ Item {
 
   function select(delta) {
     if (rows.length === 0) return
-    selectedIndex = (selectedIndex + delta + rows.length) % rows.length
+    selectedIndex = Model.wrapIndex(selectedIndex, delta, rows.length)
+  }
+
+  // ---- Super+Tab sessions --------------------------------------------------
+  // The overlay used to learn that Super was let go only by receiving the
+  // key-up itself. On a quick tap Super is up before the overlay has keyboard
+  // focus, so the key-up went to the old window: the switcher stayed up (and
+  // revealed itself after revealDelay), and the next Super+Tab stepped that
+  // dead session instead of starting a new one - landing two windows back.
+  //
+  // Hyprland sees every key in order, so it owns the session: bindings.lua
+  // numbers each hold of Super and sends release() when Super goes up, and
+  // Model.summonAction() reconciles the messages in whatever order the
+  // separate omarchy-shell processes deliver them. Steps arrive as running
+  // totals ({step, offset}), never as +1/-1, so a late or repeated message
+  // cannot move the selection twice.
+  property real sessionEpoch: 0
+  property int session: 0            // session on screen, 0 = unnumbered or none
+  property int sessionStep: 0
+  property int sessionOffset: 0
+  property int endedSession: 0
+  property int releasedSession: 0
+  property int releasedStep: 0
+  property int releasedOffset: 0
+
+  function sessionState() {
+    return {
+      opened: root.opened,
+      session: root.session,
+      endedSession: root.endedSession,
+      releasedSession: root.releasedSession
+    }
+  }
+
+  // bindings.lua stamps every message with the time its config was loaded; a
+  // Hyprland config reload restarts the numbering, so forget the old one.
+  function adoptEpoch(epoch) {
+    if (!(epoch > 0) || epoch === root.sessionEpoch) return
+    root.sessionEpoch = epoch
+    root.endedSession = 0
+    root.releasedSession = 0
+    if (!root.opened) root.session = 0
+  }
+
+  function applyStep(step, offset) {
+    if (!(step > root.sessionStep)) return
+    var delta = offset - root.sessionOffset
+    root.sessionStep = step
+    root.sessionOffset = offset
+    root.select(delta)
+  }
+
+  function endSession() {
+    if (root.session) root.endedSession = root.session
+    root.session = 0
+  }
+
+  function parsePayload(json) {
+    try { return JSON.parse(json || "{}") || ({}) } catch (e) { return ({}) }
+  }
+
+  // Super went up. Commits the session on screen; a release that beat its own
+  // summon here is remembered, and open() commits that summon on arrival.
+  //   omarchy-shell shell call piyush.omaswitch release '{"epoch":…,"session":…,"step":…,"offset":…}'
+  function release(payloadJson) {
+    var payload = root.parsePayload(payloadJson)
+    var s = Number(payload.session) || 0
+    if (!s) return "idle"
+    root.adoptEpoch(Number(payload.epoch) || 0)
+    var step = Number(payload.step) || 0
+    var offset = Number(payload.offset) || 0
+    if (s > root.releasedSession) {
+      root.releasedSession = s
+      root.releasedStep = step
+      root.releasedOffset = offset
+    }
+    if (!Model.releaseCommits(root.sessionState(), s)) return "idle"
+    root.applyStep(step, offset)
+    root.focusSelected()
+    return "committed"
   }
 
   function open(payloadJson) {
-    var payload = ({})
-    try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = ({}) }
+    var payload = root.parsePayload(payloadJson)
     var direction = Number(payload.direction) < 0 ? -1 : 1
+    var s = Number(payload.session) || 0
+    var step = Number(payload.step) > 0 ? Number(payload.step) : 1
+    var offset = isFinite(Number(payload.offset)) && payload.offset !== undefined ? Number(payload.offset) : direction
+    var carried = null
+    var commitNow = false
 
-    // Repeated Alt+Tab summons cycle instead of resetting or closing.
-    if (root.opened && payload.mode === "cycle") {
+    if (s) {
+      root.adoptEpoch(Number(payload.epoch) || 0)
+      var plan = Model.summonAction(root.sessionState(), s)
+      if (plan.action === "ignore") return
+      if (plan.action === "step") {
+        root.applyStep(step, offset)
+        return
+      }
+      commitNow = plan.commitNow
+      if (plan.commitPrevious) {
+        // Super was let go and pressed again, but that release is still in
+        // flight. Commit the old session's choice and carry it like any
+        // undispatched switch (below) rather than stepping the old session.
+        carried = root.rows[root.selectedIndex] || null
+        root.pendingWindow = carried
+        root.pendingCommand = carried ? (Model.focusCommand(carried) || "") : ""
+        root.endSession()
+      }
+    } else if (root.opened && payload.mode === "cycle") {
+      // Unnumbered summons (a binding without sessions) step the open switcher.
       root.cycleMode = true
       root.select(direction)
       return
@@ -481,14 +598,17 @@ Item {
 
     // A switch committed less than focusTimer.interval ago has not been
     // dispatched yet. Left running, it would fire in the middle of this summon:
-    // the focus dispatch pulls the keyboard away from the overlay as it maps,
-    // the modifier release is never seen, and a quick tap ends up revealing the
-    // list. Hold it instead - this summon's own commit supersedes it, and a
-    // cancel dispatches it on the way out (see dismiss()).
-    var carried = focusTimer.running ? root.pendingWindow : null
+    // the focus dispatch pulls the keyboard away from the overlay as it maps.
+    // Hold it instead - this summon's own commit supersedes it, and a cancel
+    // dispatches it on the way out (see dismiss()).
+    if (!carried && focusTimer.running) carried = root.pendingWindow
     focusTimer.stop()
 
-    root.opened = true
+    root.session = s
+    // A fresh session always starts one step from the current window, even
+    // when it is reopened mid-session (Escape, then Tab with Super still held).
+    root.sessionStep = step - 1
+    root.sessionOffset = offset - direction
     root.cycleMode = payload.mode === "cycle"
     var requested = Number(payload.revealDelay)
     root.revealDelay = isFinite(requested) && requested >= 0 ? requested : 180
@@ -514,21 +634,31 @@ Item {
     }
     root.captureCurrentWorkspace()
     root.pointerOverList = false
-    root.grabClickBinding(true)
     // rows[0] is the window you are on (sortedWindows ranks by focus history),
     // so a cycle summon always starts on the next candidate: the previous
     // window going forward, the least recent going back. Probing isCurrent()
     // here used to suppress that step whenever the compositor reported no
     // activated window - e.g. when focus had already moved to this overlay.
-    if (root.cycleMode && root.rows.length > 1)
-      root.selectedIndex = direction < 0 ? root.rows.length - 1 : 1
+    if (root.cycleMode) root.applyStep(step, offset)
+
+    // Super is already up: a quick tap whose release beat this summon. Commit
+    // without ever mapping the overlay.
+    if (commitNow) {
+      if (s === root.releasedSession) root.applyStep(root.releasedStep, root.releasedOffset)
+      root.focusSelected()
+      return
+    }
+
+    root.opened = true
+    root.syncClickBindingLater()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     focusGrab.restart()
   }
 
   function close() {
     root.opened = false
-    root.grabClickBinding(false)
+    root.endSession()
+    root.syncClickBindingLater()
     root.cycleMode = false
     root.revealed = false
     revealTimer.stop()
@@ -538,7 +668,8 @@ Item {
   // User-initiated dismissal also drops the host's openPanelIds entry.
   function dismiss() {
     root.opened = false
-    root.grabClickBinding(false)
+    root.endSession()
+    root.syncClickBindingLater()
     root.cycleMode = false
     root.revealed = false
     revealTimer.stop()
@@ -567,7 +698,7 @@ Item {
   // Rebinding that button globally is not acceptable: an exec wrapper cannot
   // start a window drag, because the compositor has to own the press for the
   // whole gesture. So the switcher borrows the button only while it is open
-  // and hands it straight back on close - see grabClickBinding().
+  // and hands it straight back on close - see syncClickBinding().
   //
   // No cursor position is passed: motion events already tell us where the
   // pointer is and whether it is over a row.
@@ -593,8 +724,25 @@ Item {
   // Borrow SUPER+left-click for as long as the switcher is up. Restoring binds
   // Omarchy's own dispatcher back, not a wrapper, so dragging windows behaves
   // exactly as it did before - the compositor owns the press again.
-  function grabClickBinding(grab) {
-    if (grab && (!root.mouseEnabled || !root.clickSelects)) return
+  //
+  // Callers only ask for a sync; the binding is reconciled against the final
+  // state once per event-loop turn. Each change is its own hyprctl process, so
+  // a grab and a restore issued back to back could reach Hyprland in either
+  // order and leave the click borrowed with the switcher closed.
+  // clickBindingApplied starts unknown (null) so the first sync always runs.
+  property var clickBindingApplied: null
+
+  function syncClickBindingLater() {
+    Qt.callLater(root.syncClickBinding)
+  }
+
+  function syncClickBinding() {
+    var want = root.opened && root.mouseEnabled && root.clickSelects
+    if (want !== root.clickBindingApplied) root.applyClickBinding(want)
+  }
+
+  function applyClickBinding(grab) {
+    root.clickBindingApplied = grab
     var lua = grab
       // NOTE: no `{ mouse = true }` here. That flag is Hyprland's bindm, which
       // only drives drag dispatchers (move/resize) - an exec bound that way
@@ -919,10 +1067,15 @@ Item {
         }
       }
 
-      // Best-effort native Alt-Tab behavior. If the compositor delivers the
-      // modifier release after granting this overlay focus, commit selection.
+      // Best-effort native Alt-Tab behavior, for unnumbered summons only. It
+      // works only when the compositor delivers the modifier release after
+      // granting this overlay focus, which a quick tap beats. A numbered
+      // session is committed by release() from Hyprland instead; acting on the
+      // key-up here too would close it before its late presses arrive.
       Keys.onReleased: function(event) {
-        if (root.cycleMode && (event.key === Qt.Key_Alt || event.key === Qt.Key_Meta)) {
+        if (root.cycleMode && root.session === 0 &&
+            (event.key === Qt.Key_Alt || event.key === Qt.Key_Meta ||
+             event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R)) {
           root.focusSelected()
           event.accepted = true
         }

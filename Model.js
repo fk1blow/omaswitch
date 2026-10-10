@@ -148,7 +148,20 @@ function isCurrent(window) {
   return !!(window && window.activated) || historyRank(window) === 0
 }
 
-function focusRank(window) {
+// focusOrder is the switcher's own most-recent-first list of windows, kept from
+// live activations. It outranks focusHistoryID, which Quickshell only reads at
+// startup and on config reload: after A -> B -> C that snapshot still says A
+// was last, and a quick tap from C went to A instead of B. A window missing
+// from focusOrder has not been focused since tracking started, so the snapshot
+// is still the truth for it - it ranks after every observed window.
+var UNOBSERVED = 1000
+
+function focusRank(window, focusOrder) {
+  if (window && window.activated) return -1
+  if (focusOrder && focusOrder.length > 0) {
+    var observed = focusOrder.indexOf(window)
+    return observed !== -1 ? observed : UNOBSERVED + historyRank(window)
+  }
   return isCurrent(window) ? -1 : historyRank(window)
 }
 
@@ -169,17 +182,77 @@ function isRealWindow(window) {
   return true
 }
 
-function sortedWindows(values) {
+function sortedWindows(values, focusOrder) {
   var source = values && typeof values.slice === "function" ? values.slice() : []
   source = source.filter(isRealWindow)
   var decorated = []
   for (var i = 0; i < source.length; i++) decorated.push({ value: source[i], index: i })
   decorated.sort(function(left, right) {
-    return focusRank(left.value) - focusRank(right.value) || left.index - right.index
+    return focusRank(left.value, focusOrder) - focusRank(right.value, focusOrder) || left.index - right.index
   })
   var result = []
   for (var j = 0; j < decorated.length; j++) result.push(decorated[j].value)
   return result
+}
+
+// Most-recent-first focus list after `window` is activated. Destroyed windows
+// come back from QML as null and are dropped here; the cap keeps it bounded.
+function notedFocus(focusOrder, window, cap) {
+  var limit = cap || 64
+  var next = window ? [window] : []
+  var list = focusOrder || []
+  for (var i = 0; i < list.length && next.length < limit; i++)
+    if (list[i] && list[i] !== window) next.push(list[i])
+  return next
+}
+
+// Modular step through n rows; select(-5) on 3 rows must not go negative.
+function wrapIndex(index, delta, n) {
+  if (!(n > 0)) return 0
+  return (((index + delta) % n) + n) % n
+}
+
+// ---------------------------------------------------------------------------
+// Super+Tab sessions.
+//
+// Hyprland numbers each hold of Super (bindings.lua): every Super+Tab sends a
+// summon {session, step, offset}, and letting go of Super sends a release
+// {session, step, offset}. step counts the presses in the session, offset is
+// their signed sum. Each message is its own omarchy-shell process, so they
+// reach the switcher in no particular order - a quick tap's release regularly
+// beats its own summon. These decide what a message means given what the
+// switcher has already seen, so that no ordering can leave it open:
+//
+//   state.opened            the overlay is up
+//   state.session           the session it is showing (0 = none)
+//   state.endedSession      the last session the overlay closed
+//   state.releasedSession   the newest session Hyprland reported released
+//
+// summonAction() answers one of
+//   "step"    another press of the session on screen - move the selection
+//   "ignore"  a press of a session that is already over, delivered late
+//   "open"    a new session; commitPrevious when one is still on screen (its
+//             release is in flight), commitNow when this session's release
+//             already arrived (a quick tap - open, select, commit, unseen)
+// ---------------------------------------------------------------------------
+function summonAction(state, session) {
+  var s = Number(session) || 0
+  if (state.opened && s === state.session) return { action: "step" }
+  if (s < state.endedSession) return { action: "ignore" }
+  // Closed by its release already: a press that lost the race to it.
+  if (s === state.endedSession && s <= state.releasedSession) return { action: "ignore" }
+  return {
+    action: "open",
+    commitPrevious: !!(state.opened && state.session && state.session !== s),
+    commitNow: s <= state.releasedSession
+  }
+}
+
+// A release commits the session on screen, and only that one: a release for a
+// session that never opened is remembered (releasedSession) for its summon.
+function releaseCommits(state, session) {
+  var s = Number(session) || 0
+  return !!(s && state.opened && state.session === s)
 }
 
 function filteredWindows(values, query) {
@@ -361,6 +434,10 @@ if (typeof module !== "undefined") module.exports = {
   isRealWindow: isRealWindow,
   windowAt: windowAt,
   sortedWindows: sortedWindows,
+  notedFocus: notedFocus,
+  wrapIndex: wrapIndex,
+  summonAction: summonAction,
+  releaseCommits: releaseCommits,
   filteredWindows: filteredWindows,
   focusCommand: focusCommand,
   flatten: flatten,
